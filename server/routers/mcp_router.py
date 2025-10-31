@@ -8,7 +8,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.utils.logger import logger
 
@@ -26,18 +26,17 @@ except ImportError as e:
 
 mcp = APIRouter(prefix="/mcp", tags=["mcp", "Model Context Protocol"])
 
-# Global MCP server instance and active streams
+# Global MCP server instance
 _mcp_server_instance = None
-_active_streams: Dict[str, Dict[str, Any]] = {}
 
 class MCPMessage(BaseModel):
     """Standard MCP JSON-RPC Message"""
-    jsonrpc: str = "2.0"
-    id: Optional[str] = None
-    method: Optional[str] = None
-    params: Optional[Dict[str, Any]] = None
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
+    jsonrpc: str = Field(default="2.0", description="JSON-RPC version")
+    id: Optional[str] = Field(default=None, description="Request ID")
+    method: Optional[str] = Field(default=None, description="Method name")
+    params: Optional[Dict[str, Any]] = Field(default=None, description="Method parameters")
+    result: Optional[Any] = Field(default=None, description="Result for successful response")
+    error: Optional[Dict[str, Any]] = Field(default=None, description="Error information")
 
 def get_mcp_server():
     """Get or create MCP server instance"""
@@ -55,8 +54,8 @@ def get_mcp_server():
     
     return _mcp_server_instance
 
-async def handle_mcp_message(message: MCPMessage) -> Optional[MCPMessage]:
-    """Handle MCP JSON-RPC message according to standard protocol"""
+async def handle_mcp_request(message: MCPMessage) -> Optional[MCPMessage]:
+    """Handle MCP JSON-RPC request according to standard protocol"""
     try:
         mcp_server = get_mcp_server()
         
@@ -82,10 +81,18 @@ async def handle_mcp_message(message: MCPMessage) -> Optional[MCPMessage]:
                 result={
                     "protocolVersion": protocol_version,
                     "capabilities": {
-                        "tools": {},
+                        "tools": {
+                            "listChanged": False
+                        },
                         "logging": {},
-                        "prompts": {},
-                        "resources": {}
+                        "prompts": {
+                            "listChanged": False
+                        },
+                        "resources": {
+                            "listChanged": False,
+                            "subscribe": False,
+                            "listChanged": False
+                        }
                     },
                     "serverInfo": {
                         "name": "Yuxi-Know Knowledge Base MCP Server",
@@ -159,34 +166,60 @@ async def handle_mcp_message(message: MCPMessage) -> Optional[MCPMessage]:
                     }
                 )
             
-            if tool_name == "query_knowledge_base":
-                result = await mcp_server._query_knowledge_base(arguments)
-            elif tool_name == "list_knowledge_bases":
-                result = await mcp_server._list_knowledge_bases()
-            else:
+            try:
+                if tool_name == "query_knowledge_base":
+                    result = await mcp_server._query_knowledge_base(arguments)
+                elif tool_name == "list_knowledge_bases":
+                    result = await mcp_server._list_knowledge_bases()
+                else:
+                    return MCPMessage(
+                        id=message.id,
+                        error={
+                            "code": -32601,
+                            "message": f"Unknown tool: {tool_name}"
+                        }
+                    )
+                
+                # Format result according to MCP standard
+                content = []
+                if hasattr(result, 'content') and result.content:
+                    for item in result.content:
+                        if hasattr(item, 'text'):
+                            content.append({
+                                "type": "text",
+                                "text": item.text
+                            })
+                        elif isinstance(item, dict):
+                            content.append(item)
+                        else:
+                            content.append({
+                                "type": "text", 
+                                "text": str(item)
+                            })
+                else:
+                    # If no content, add a default text result
+                    content.append({
+                        "type": "text",
+                        "text": str(result) if result else "Tool executed successfully"
+                    })
+                
+                return MCPMessage(
+                    id=message.id,
+                    result={
+                        "content": content,
+                        "isError": False
+                    }
+                )
+                
+            except Exception as e:
+                logger.error(f"Error executing tool {tool_name}: {e}")
                 return MCPMessage(
                     id=message.id,
                     error={
-                        "code": -32601,
-                        "message": f"Unknown tool: {tool_name}"
+                        "code": -32603,
+                        "message": f"Tool execution failed: {str(e)}"
                     }
                 )
-            
-            # Extract content from result
-            content = []
-            if hasattr(result, 'content') and result.content:
-                for item in result.content:
-                    if hasattr(item, 'text'):
-                        content.append({"type": "text", "text": item.text})
-                    elif isinstance(item, dict):
-                        content.append(item)
-                    else:
-                        content.append({"type": "text", "text": str(item)})
-            
-            return MCPMessage(
-                id=message.id,
-                result={"content": content}
-            )
         
         # Handle ping (keepalive)
         elif message.method == "ping":
@@ -211,7 +244,7 @@ async def handle_mcp_message(message: MCPMessage) -> Optional[MCPMessage]:
             )
     
     except Exception as e:
-        logger.error(f"Error handling MCP message: {e}")
+        logger.error(f"Error handling MCP request: {e}")
         logger.error(traceback.format_exc())
         return MCPMessage(
             id=message.id,
@@ -226,97 +259,99 @@ async def handle_mcp_message(message: MCPMessage) -> Optional[MCPMessage]:
 # =============================================================================
 
 @mcp.api_route("", methods=["GET", "POST"])
-async def mcp_endpoint(
+async def mcp_streamable_http_endpoint(
     request: Request,
-    accept: Optional[str] = Header(None),
-    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID")
+    accept: Optional[str] = Header(None)
 ):
     """
     Standard MCP Streamable HTTP endpoint
     
-    - GET: Opens SSE stream for server-to-client communication
-    - POST: Sends JSON-RPC message from client to server
+    This endpoint implements the official MCP Streamable HTTP transport:
+    - GET: Establishes SSE stream for server-to-client communication  
+    - POST: Handles client-to-server JSON-RPC messages
+    
+    Reference: https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/
     """
     try:
         if not MCP_AVAILABLE:
-            raise HTTPException(status_code=500, detail="MCP server not available")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32603,
+                        "message": "MCP server not available"
+                    }
+                }
+            )
         
         if request.method == "GET":
-            # Handle SSE stream request
+            # Handle SSE stream establishment for server-to-client communication
             if not accept or "text/event-stream" not in accept:
-                raise HTTPException(
-                    status_code=406, 
-                    detail="Accept header must include text/event-stream"
+                return JSONResponse(
+                    status_code=406,
+                    content={
+                        "jsonrpc": "2.0", 
+                        "error": {
+                            "code": -32602,
+                            "message": "Accept header must include text/event-stream for SSE"
+                        }
+                    }
                 )
             
-            # Create stream ID for this connection
-            stream_id = str(uuid.uuid4())
+            # Generate unique session ID for this stream
+            session_id = str(uuid.uuid4())
             
-            async def event_generator() -> AsyncGenerator[Dict[str, str], None]:
-                """Generate SSE events for MCP communication"""
+            async def sse_event_generator() -> AsyncGenerator[Dict[str, str], None]:
+                """Generate SSE events for MCP server-to-client communication"""
                 try:
-                    # Store stream info
-                    _active_streams[stream_id] = {
-                        "created_at": datetime.now(),
-                        "last_activity": datetime.now(),
-                        "message_queue": asyncio.Queue(),
-                        "connected": True
-                    }
+                    logger.info(f"MCP SSE stream established: {session_id}")
                     
-                    logger.info(f"MCP SSE stream opened: {stream_id}")
-                    
-                    # Send connection event
+                    # Send initial connection event
                     yield {
-                        "id": str(uuid.uuid4()),
                         "event": "connected",
                         "data": json.dumps({
-                            "stream_id": stream_id,
+                            "sessionId": session_id,
                             "timestamp": datetime.now().isoformat(),
-                            "message": "MCP SSE stream established"
+                            "protocol": "MCP",
+                            "version": "2024-11-05"
                         })
                     }
                     
-                    # Keep connection alive and handle messages
-                    while _active_streams.get(stream_id, {}).get("connected", False):
+                    # Keep stream alive and handle server-initiated messages
+                    message_count = 0
+                    while True:
                         try:
-                            # Wait for messages with timeout
-                            message = await asyncio.wait_for(
-                                _active_streams[stream_id]["message_queue"].get(),
-                                timeout=30.0
-                            )
+                            # Wait for any server-initiated events or keepalive
+                            await asyncio.sleep(30.0)  # 30-second keepalive interval
                             
+                            # Send periodic ping to keep connection alive
+                            message_count += 1
                             yield {
-                                "id": str(uuid.uuid4()),
-                                "event": "message",
-                                "data": json.dumps(message)
-                            }
-                            
-                        except asyncio.TimeoutError:
-                            # Send keepalive ping
-                            yield {
-                                "id": str(uuid.uuid4()),
                                 "event": "ping",
                                 "data": json.dumps({
-                                    "timestamp": datetime.now().isoformat()
+                                    "timestamp": datetime.now().isoformat(),
+                                    "messageCount": message_count
                                 })
                             }
                             
+                        except asyncio.CancelledError:
+                            logger.info(f"MCP SSE stream cancelled: {session_id}")
+                            break
                         except Exception as e:
-                            logger.error(f"Error in SSE stream: {e}")
+                            logger.error(f"Error in MCP SSE stream: {e}")
                             yield {
-                                "id": str(uuid.uuid4()),
-                                "event": "error",
+                                "event": "error", 
                                 "data": json.dumps({
                                     "error": str(e),
                                     "timestamp": datetime.now().isoformat()
                                 })
                             }
                             break
-                
+                            
                 except Exception as e:
-                    logger.error(f"Fatal error in SSE generator: {e}")
+                    logger.error(f"Fatal error in MCP SSE generator: {e}")
                     yield {
-                        "id": str(uuid.uuid4()),
                         "event": "error",
                         "data": json.dumps({
                             "error": f"Fatal SSE error: {str(e)}",
@@ -324,85 +359,122 @@ async def mcp_endpoint(
                         })
                     }
                 finally:
-                    # Clean up stream
-                    if stream_id in _active_streams:
-                        _active_streams[stream_id]["connected"] = False
-                        del _active_streams[stream_id]
-                    logger.info(f"MCP SSE stream closed: {stream_id}")
+                    logger.info(f"MCP SSE stream closed: {session_id}")
             
-            return EventSourceResponse(event_generator())
+            return EventSourceResponse(sse_event_generator())
         
         elif request.method == "POST":
-            # Handle JSON-RPC message
+            # Handle JSON-RPC message from client to server
             try:
                 message_data = await request.json()
             except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid JSON")
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32700,
+                            "message": "Parse error: Invalid JSON"
+                        }
+                    }
+                )
             
-            # Validate JSON-RPC format
-            if not isinstance(message_data, dict) or message_data.get("jsonrpc") != "2.0":
-                raise HTTPException(status_code=400, detail="Invalid JSON-RPC message format")
+            # Validate basic JSON-RPC structure
+            if not isinstance(message_data, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Request: Message must be a JSON object"
+                        }
+                    }
+                )
+            
+            # Validate JSON-RPC version
+            if message_data.get("jsonrpc") != "2.0":
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Request: jsonrpc field must be '2.0'"
+                        }
+                    }
+                )
             
             # Create MCP message object
             try:
                 mcp_message = MCPMessage(**message_data)
             except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid message format: {str(e)}")
-            
-            # Handle the message
-            response = await handle_mcp_message(mcp_message)
-            
-            # Determine response type based on Accept header
-            if accept and "text/event-stream" in accept:
-                # Client wants SSE stream response
-                async def response_generator() -> AsyncGenerator[Dict[str, str], None]:
-                    if response:
-                        yield {
-                            "id": str(uuid.uuid4()),
-                            "event": "response",
-                            "data": json.dumps(response.dict(exclude_none=True))
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32600,
+                            "message": f"Invalid Request: {str(e)}"
                         }
-                    
-                    # Close stream after response
-                    yield {
-                        "id": str(uuid.uuid4()),
-                        "event": "close",
-                        "data": json.dumps({"message": "Response complete"})
                     }
-                
-                return EventSourceResponse(response_generator())
+                )
             
+            # Process the MCP request
+            logger.info(f"Processing MCP request: {mcp_message.method}")
+            response = await handle_mcp_request(mcp_message)
+            
+            # Return appropriate response
+            if response is None:
+                # This was a notification - return 202 Accepted with no content
+                return JSONResponse(
+                    status_code=202,
+                    content={"status": "accepted"}
+                )
             else:
-                # Return JSON response
-                if response:
-                    return JSONResponse(
-                        content=response.dict(exclude_none=True),
-                        status_code=200
-                    )
-                else:
-                    # Notification - no response
-                    return JSONResponse(
-                        content={"status": "accepted"},
-                        status_code=202
-                    )
+                # Return the JSON-RPC response
+                return JSONResponse(
+                    status_code=200,
+                    content=response.dict(exclude_none=True)
+                )
         
         else:
-            raise HTTPException(status_code=405, detail="Method not allowed")
+            # This should never happen due to FastAPI routing, but handle defensively
+            return JSONResponse(
+                status_code=405,
+                content={
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32601,
+                        "message": "Method not allowed"
+                    }
+                }
+            )
             
-    except HTTPException:
-        raise
+    except HTTPException as he:
+        # Re-raise HTTP exceptions
+        raise he
     except Exception as e:
-        logger.error(f"Error in MCP endpoint: {e}")
+        logger.error(f"Unexpected error in MCP Streamable HTTP endpoint: {e}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+        )
 
 # =============================================================================
-# === MCP Server Information Endpoints ===
+# === MCP Server Information Endpoints (for debugging/discovery) ===
 # =============================================================================
 
 @mcp.get("/status")
 async def get_mcp_status():
-    """Get MCP server status and capabilities"""
+    """Get MCP server status and capabilities (non-standard but useful for debugging)"""
     try:
         if not MCP_AVAILABLE:
             return {
@@ -410,20 +482,22 @@ async def get_mcp_status():
                 "error": "MCP dependencies not available",
                 "protocol": "MCP",
                 "transport": "streamable-http",
-                "version": "2024-11-05"
+                "version": "2024-11-05",
+                "available": False
             }
         
+        # Test server initialization
         mcp_server = get_mcp_server()
+        
         return {
             "status": "running",
-            "protocol": "MCP",
-            "transport": "streamable-http",
+            "protocol": "Model Context Protocol (MCP)",
             "version": "2024-11-05",
-            "server_info": {
+            "transport": "Streamable HTTP",
+            "serverInfo": {
                 "name": "Yuxi-Know Knowledge Base MCP Server",
                 "version": "1.0.0"
             },
-            "active_streams": len(_active_streams),
             "available": True,
             "capabilities": {
                 "tools": ["query_knowledge_base", "list_knowledge_bases"],
@@ -431,7 +505,16 @@ async def get_mcp_status():
                 "prompts": False,
                 "resources": False
             },
-            "endpoint": "/api/mcp"
+            "endpoints": {
+                "main": "/api/mcp",
+                "status": "/api/mcp/status",
+                "info": "/api/mcp/info"
+            },
+            "compliance": {
+                "standard": "MCP Specification 2024-11-05",
+                "transport": "Streamable HTTP",
+                "json_rpc": "2.0"
+            }
         }
     except Exception as e:
         logger.error(f"Error getting MCP status: {e}")
@@ -445,18 +528,26 @@ async def get_mcp_status():
 
 @mcp.get("/info")
 async def get_mcp_info():
-    """Get detailed MCP server information"""
+    """Get detailed MCP server information (non-standard but useful for documentation)"""
     return {
         "name": "Yuxi-Know Knowledge Base MCP Server",
         "description": "Standard MCP server providing access to knowledge base tools",
         "protocol": "Model Context Protocol (MCP)",
         "version": "2024-11-05",
         "transport": "Streamable HTTP",
-        "specification": "https://modelcontextprotocol.io/specification/",
+        "specification": "https://modelcontextprotocol.io/specification/2024-11-05/",
+        "implementation": {
+            "language": "Python",
+            "framework": "FastAPI",
+            "server": "Yuxi-Know Knowledge Base"
+        },
         "usage": {
-            "connection": "Single endpoint at /api/mcp supporting both GET (SSE) and POST (JSON-RPC)",
-            "initialization": "Send initialize JSON-RPC request with protocolVersion and clientInfo",
-            "tools": "Use tools/list to get available tools, tools/call to execute them"
+            "connection": "Single endpoint at /api/mcp with GET (SSE) and POST (JSON-RPC)",
+            "initialization": "Send initialize JSON-RPC request",
+            "tools": {
+                "list": "Use tools/list method",
+                "call": "Use tools/call method with name and arguments"
+            }
         },
         "tools": [
             {
@@ -472,57 +563,8 @@ async def get_mcp_info():
         ],
         "compliance": {
             "standard": "MCP Specification 2024-11-05",
-            "transport": "Streamable HTTP (replaces deprecated HTTP+SSE)",
-            "json_rpc": "2.0",
+            "transport": "Streamable HTTP (official)",
+            "json_rpc": "2.0 (strict)",
             "features": ["tools", "logging", "streaming"]
         }
     }
-
-# =============================================================================
-# === Stream Management ===
-# =============================================================================
-
-@mcp.get("/streams")
-async def list_active_streams():
-    """List all active SSE streams (for debugging)"""
-    streams = []
-    for stream_id, stream_data in _active_streams.items():
-        streams.append({
-            "stream_id": stream_id,
-            "created_at": stream_data["created_at"].isoformat(),
-            "last_activity": stream_data["last_activity"].isoformat(),
-            "connected": stream_data.get("connected", False)
-        })
-    
-    return {
-        "active_streams": len(streams),
-        "streams": streams
-    }
-
-# Background task to clean up inactive streams
-async def cleanup_inactive_streams():
-    """Clean up streams that have been inactive for too long"""
-    while True:
-        try:
-            now = datetime.now()
-            inactive_streams = []
-            
-            for stream_id, stream_data in _active_streams.items():
-                last_activity = stream_data.get("last_activity", now)
-                if (now - last_activity).total_seconds() > 3600:  # 1 hour timeout
-                    inactive_streams.append(stream_id)
-            
-            for stream_id in inactive_streams:
-                if stream_id in _active_streams:
-                    _active_streams[stream_id]["connected"] = False
-                    del _active_streams[stream_id]
-                    logger.info(f"Cleaned up inactive stream: {stream_id}")
-            
-            await asyncio.sleep(300)  # Check every 5 minutes
-            
-        except Exception as e:
-            logger.error(f"Error in stream cleanup: {e}")
-            await asyncio.sleep(60)
-
-# Start cleanup task when module is imported
-asyncio.create_task(cleanup_inactive_streams())
