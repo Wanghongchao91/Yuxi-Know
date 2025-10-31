@@ -263,26 +263,11 @@ class KnowledgeBaseServer:
                 result = all_results[:top_k]  # Limit total results
                 source_info = f"Searched {len(retrievers)} databases"
             
-            # Format result
-            if isinstance(result, list) and len(result) > 0:
-                formatted_results = []
-                for i, item in enumerate(result, 1):
-                    if isinstance(item, dict):
-                        content = item.get("content", str(item))
-                        source = item.get("source_name", item.get("source_db", "Unknown"))
-                        score = item.get("score", "N/A")
-                        formatted_results.append(f"Result {i} (Source: {source}, Score: {score}):\n{content}")
-                    else:
-                        formatted_results.append(f"Result {i}:\n{str(item)}")
-                
-                response_text = f"Query: {query_text}\n{source_info}\nFound {len(result)} results:\n\n" + "\n\n---\n\n".join(formatted_results)
-            else:
-                response_text = f"Query: {query_text}\n{source_info}\nNo results found."
-            
+            # Pass through original results without extra formatting
             return CallToolResult(
                 content=[TextContent(
                     type="text",
-                    text=response_text
+                    text=json.dumps(result, ensure_ascii=False)
                 )]
             )
             
