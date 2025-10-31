@@ -18,6 +18,7 @@ try:
     from mcp.types import JSONRPCRequest, JSONRPCNotification, JSONRPCMessage
     from src.mcp_servers.knowledge_base_server import KnowledgeBaseServer
     from src.knowledge import knowledge_base
+
     MCP_AVAILABLE = True
 except ImportError as e:
     logger.error(f"Failed to import MCP server modules: {e}")
@@ -102,7 +103,7 @@ async def handle_mcp_request(message: MCPMessage) -> Optional[MCPMessage]:
             )
         
         # Handle tools/list
-        elif message.method == "tools/list":
+        elif message.method == "tools-list":
             tools = [
                 {
                     "name": "query_knowledge_base",
