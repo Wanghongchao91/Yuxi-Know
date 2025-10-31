@@ -1,48 +1,36 @@
 import asyncio
 import json
+import uuid
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, List
 
-from fastapi import APIRouter, Body, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import StreamingResponse
+from sse_starlette import EventSourceResponse
+from pydantic import BaseModel
 
 from src.utils import logger
 
 # Import MCP server functionality
 try:
+    from mcp.server import Server
+    from mcp.types import JSONRPCRequest, JSONRPCNotification, JSONRPCMessage
     from src.mcp_servers.knowledge_base_server import KnowledgeBaseServer
-    from src.knowledge import knowledge_base
+    from src.knowledge_base import knowledge_base
 except ImportError as e:
     logger.error(f"Failed to import MCP server modules: {e}")
     KnowledgeBaseServer = None
 
-mcp = APIRouter(prefix="/mcp", tags=["mcp"])
+mcp = APIRouter(prefix="/mcp", tags=["mcp", "Model Context Protocol"])
 
-# Pydantic models for request/response
-class MCPToolListResponse(BaseModel):
-    """Response model for MCP tool listing"""
-    tools: List[Dict[str, Any]]
-    count: int
+# MCP Session Management
+class MCPSession(BaseModel):
+    """MCP Session model"""
+    session_id: str
+    initialized: bool = False
 
-class MCPToolCallRequest(BaseModel):
-    """Request model for MCP tool calls"""
-    tool_name: str = Field(description="Name of the tool to call")
-    arguments: Dict[str, Any] = Field(default={}, description="Arguments for the tool")
-
-class MCPToolCallResponse(BaseModel):
-    """Response model for MCP tool calls"""
-    success: bool
-    content: str
-    error: Optional[str] = None
-
-class KnowledgeQueryRequest(BaseModel):
-    """Request model for knowledge base queries"""
-    query_text: str = Field(description="The query text to search for")
-    db_id: Optional[str] = Field(default=None, description="Specific database ID to query (optional)")
-    mode: Optional[str] = Field(default="mix", description="Query mode (local, global, hybrid, naive, mix)")
-    top_k: Optional[int] = Field(default=10, description="Maximum number of results to return")
-
-# Global MCP server instance
+# Global session storage and MCP server
+_mcp_sessions: Dict[str, Dict[str, Any]] = {}
 _mcp_server_instance = None
 
 def get_mcp_server():
@@ -51,245 +39,296 @@ def get_mcp_server():
     if _mcp_server_instance is None:
         if KnowledgeBaseServer is None:
             raise HTTPException(status_code=500, detail="MCP server not available")
-        _mcp_server_instance = KnowledgeBaseServer()
+        
+        kb_server = KnowledgeBaseServer()
+        _mcp_server_instance = kb_server.server
+        logger.info("MCP server instance created")
+    
     return _mcp_server_instance
 
-# =============================================================================
-# === MCP 服务管理分组 ===
-# =============================================================================
 
-@mcp.get("/tools", response_model=MCPToolListResponse)
-async def list_mcp_tools():
-    """列出所有可用的MCP工具"""
-    try:
-        server = get_mcp_server()
-        
-        # 模拟调用list_tools方法
-        tools = []
-        
-        # 获取知识库信息
-        try:
-            databases = knowledge_base.get_databases()
-            retrievers = knowledge_base.get_retrievers()
-            
-            # 通用查询工具
-            tools.append({
-                "name": "query_knowledge_base",
-                "description": "Query all available knowledge bases with intelligent routing",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query_text": {"type": "string", "description": "The query text to search for"},
-                        "db_id": {"type": "string", "description": "Specific database ID to query (optional)"},
-                        "mode": {"type": "string", "enum": ["local", "global", "hybrid", "naive", "mix"], "default": "mix"},
-                        "top_k": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100}
-                    },
-                    "required": ["query_text"]
-                }
-            })
-            
-            # 为每个知识库创建专用工具
-            for db_id, retriever_info in retrievers.items():
-                safe_name = retriever_info["name"].replace(" ", "_").replace("-", "_")[:30]
-                tool_name = f"query_{safe_name}_{db_id}"
-                
-                tools.append({
-                    "name": tool_name,
-                    "description": f"Query {retriever_info['name']} knowledge base. {retriever_info.get('description', '')}",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {
-                            "query_text": {"type": "string", "description": "The query text to search for"},
-                            "mode": {"type": "string", "enum": ["local", "global", "hybrid", "naive", "mix"], "default": "mix"},
-                            "top_k": {"type": "integer", "default": 10, "minimum": 1, "maximum": 100}
-                        },
-                        "required": ["query_text"]
-                    }
-                })
-            
-            # 知识库列表工具
-            tools.append({
-                "name": "list_knowledge_bases",
-                "description": "List all available knowledge bases and their information",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {},
-                    "required": []
-                }
-            })
-            
-        except Exception as e:
-            logger.error(f"Error getting knowledge base info: {e}")
-            # 返回基本工具
-            tools = [{
-                "name": "query_knowledge_base",
-                "description": "Query knowledge bases (error occurred during initialization)",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query_text": {"type": "string", "description": "The query text"}
-                    },
-                    "required": ["query_text"]
-                }
-            }]
-        
-        return MCPToolListResponse(tools=tools, count=len(tools))
-        
-    except Exception as e:
-        logger.error(f"Error listing MCP tools: {e}, {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to list MCP tools: {str(e)}")
+def create_session() -> str:
+    """Create a new MCP session"""
+    session_id = str(uuid.uuid4())
+    _mcp_sessions[session_id] = {
+        "message_queue": asyncio.Queue(),
+        "initialized": False
+    }
+    return session_id
 
-@mcp.post("/tools/call", response_model=MCPToolCallResponse)
-async def call_mcp_tool(request: MCPToolCallRequest):
-    """调用指定的MCP工具"""
+
+def get_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Get session by ID"""
+    return _mcp_sessions.get(session_id)
+
+
+async def handle_jsonrpc_message(session_id: str, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Handle incoming JSON-RPC message and return response if needed"""
+    mcp_server = get_mcp_server()
+    
+    session = get_session(session_id)
+    if not session:
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {
+                "code": -32000,
+                "message": "Invalid session"
+            }
+        }
+    
     try:
-        server = get_mcp_server()
-        
-        # 根据工具名称路由到相应的处理方法
-        if request.tool_name == "query_knowledge_base":
-            result = await server._query_knowledge_base(request.arguments)
-        elif request.tool_name == "list_knowledge_bases":
-            result = await server._list_knowledge_bases()
-        elif request.tool_name.startswith("query_"):
-            # 从工具名称中提取数据库ID
-            parts = request.tool_name.split("_")
-            if len(parts) >= 2:
-                db_id = parts[-1]
-                arguments = request.arguments.copy()
-                arguments["db_id"] = db_id
-                result = await server._query_knowledge_base(arguments)
+        # Convert dict to proper JSON-RPC message object
+        if "method" in message:
+            if "id" in message:
+                # Request
+                jsonrpc_msg = JSONRPCRequest(
+                    jsonrpc="2.0",
+                    id=message["id"],
+                    method=message["method"],
+                    params=message.get("params")
+                )
             else:
-                raise HTTPException(status_code=400, detail=f"Invalid tool name format: {request.tool_name}")
+                # Notification
+                jsonrpc_msg = JSONRPCNotification(
+                    jsonrpc="2.0",
+                    method=message["method"],
+                    params=message.get("params")
+                )
         else:
-            raise HTTPException(status_code=404, detail=f"Unknown tool: {request.tool_name}")
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {
+                    "code": -32600,
+                    "message": "Invalid Request"
+                }
+            }
         
-        # 提取结果内容
-        if hasattr(result, 'content') and result.content:
-            content = result.content[0].text if result.content else "No content"
-            success = not getattr(result, 'isError', False)
-            error = None if success else content
-        else:
-            content = str(result)
-            success = True
-            error = None
+        # Process message through MCP server
+        # Note: This is a simplified implementation
+        # In a real MCP server, you would use the server's message handling
         
-        return MCPToolCallResponse(
-            success=success,
-            content=content,
-            error=error
-        )
+        if jsonrpc_msg.method == "tools/list":
+            # Handle tools list request
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "tools": [
+                        {
+                            "name": "query_knowledge_base",
+                            "description": "Query knowledge bases",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "query_text": {"type": "string"},
+                                    "db_id": {"type": "string"},
+                                    "mode": {"type": "string", "enum": ["local", "global", "hybrid", "naive", "mix"]},
+                                    "top_k": {"type": "integer", "default": 10}
+                                },
+                                "required": ["query_text"]
+                            }
+                        }
+                    ]
+                }
+            }
+        elif jsonrpc_msg.method == "tools/call":
+            # Handle tool call request
+            params = jsonrpc_msg.params or {}
+            tool_name = params.get("name")
+            arguments = params.get("arguments", {})
+            
+            if tool_name == "query_knowledge_base":
+                # Use the KnowledgeBaseServer instance
+                kb_server = KnowledgeBaseServer()
+                result = await kb_server._query_knowledge_base(arguments)
+                
+                # Extract content
+                content = ""
+                if hasattr(result, 'content') and result.content:
+                    for item in result.content:
+                        if hasattr(item, 'text'):
+                            content += item.text + "\n"
+                        else:
+                            content += str(item) + "\n"
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "result": {
+                        "content": [{"type": "text", "text": content.strip()}]
+                    }
+                }
         
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error calling MCP tool {request.tool_name}: {e}, {traceback.format_exc()}")
-        return MCPToolCallResponse(
-            success=False,
-            content="",
-            error=f"Error executing tool: {str(e)}"
-        )
-
-# =============================================================================
-# === 知识库查询快捷接口 ===
-# =============================================================================
-
-@mcp.post("/query", response_model=MCPToolCallResponse)
-async def query_knowledge_base_direct(request: KnowledgeQueryRequest):
-    """直接查询知识库的快捷接口"""
-    try:
-        server = get_mcp_server()
-        
-        arguments = {
-            "query_text": request.query_text,
-            "db_id": request.db_id,
-            "mode": request.mode,
-            "top_k": request.top_k
+        # Default response for unhandled methods
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {
+                "code": -32601,
+                "message": "Method not found"
+            }
         }
         
-        result = await server._query_knowledge_base(arguments)
-        
-        # 提取结果内容
-        if hasattr(result, 'content') and result.content:
-            content = result.content[0].text if result.content else "No content"
-            success = not getattr(result, 'isError', False)
-            error = None if success else content
-        else:
-            content = str(result)
-            success = True
-            error = None
-        
-        return MCPToolCallResponse(
-            success=success,
-            content=content,
-            error=error
-        )
-        
     except Exception as e:
-        logger.error(f"Error in direct knowledge base query: {e}, {traceback.format_exc()}")
-        return MCPToolCallResponse(
-            success=False,
-            content="",
-            error=f"Error querying knowledge base: {str(e)}"
-        )
+        logger.error(f"Error handling JSON-RPC message: {e}")
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {
+                "code": -32603,
+                "message": f"Internal error: {str(e)}"
+            }
+        }
+    
+    return None
 
-@mcp.get("/knowledge-bases")
-async def list_knowledge_bases_direct():
-    """直接列出知识库的快捷接口"""
+# =============================================================================
+# === MCP Standard Endpoints ===
+# =============================================================================
+
+@mcp.post("/session")
+async def create_mcp_session():
+    """Create a new MCP session (Standard MCP endpoint)"""
+    session_id = create_session()
+    return {"session_id": session_id}
+
+
+@mcp.post("/message/{session_id}")
+async def handle_mcp_message(session_id: str, request: Request):
+    """Handle JSON-RPC message from client (Standard MCP endpoint)"""
     try:
-        server = get_mcp_server()
-        result = await server._list_knowledge_bases()
+        message = await request.json()
         
-        # 提取结果内容
-        if hasattr(result, 'content') and result.content:
-            content = result.content[0].text if result.content else "No content"
-            success = not getattr(result, 'isError', False)
+        # Validate JSON-RPC format
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+            raise HTTPException(status_code=400, detail="Invalid JSON-RPC message")
+        
+        response = await handle_jsonrpc_message(session_id, message)
+        
+        if response:
+            return response
         else:
-            content = str(result)
-            success = True
-        
-        if success:
-            return {"success": True, "content": content}
-        else:
-            raise HTTPException(status_code=500, detail=content)
-        
-    except HTTPException:
-        raise
+            return {"status": "processed"}
+            
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
-        logger.error(f"Error listing knowledge bases: {e}, {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Error listing knowledge bases: {str(e)}")
+        logger.error(f"Error handling message: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# =============================================================================
-# === MCP 服务器状态 ===
-# =============================================================================
+
+@mcp.get("/events/{session_id}")
+async def stream_mcp_events(session_id: str):
+    """Stream server-to-client events via SSE (Standard MCP endpoint)"""
+    session = get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    async def event_generator():
+        """Generate SSE events"""
+        try:
+            # Send initial connection event
+            yield {
+                "event": "connected",
+                "data": json.dumps({"session_id": session_id, "status": "connected"})
+            }
+            
+            # Stream messages from queue
+            while True:
+                try:
+                    # Wait for message with timeout
+                    message = await asyncio.wait_for(
+                        session["message_queue"].get(), 
+                        timeout=30.0
+                    )
+                    
+                    yield {
+                        "event": "message",
+                        "data": json.dumps(message)
+                    }
+                    
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    yield {
+                        "event": "keepalive",
+                        "data": json.dumps({"timestamp": asyncio.get_event_loop().time()})
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error in event stream: {e}")
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": str(e)})
+            }
+    
+    return EventSourceResponse(event_generator())
+
 
 @mcp.get("/status")
-async def get_mcp_server_status():
-    """获取MCP服务器状态"""
+async def get_mcp_status():
+    """Get MCP server status (Standard MCP endpoint)"""
     try:
-        server = get_mcp_server()
-        
-        # 检查知识库连接
-        try:
-            databases = knowledge_base.get_databases()
-            retrievers = knowledge_base.get_retrievers()
-            kb_status = "connected"
-            kb_count = len(retrievers)
-        except Exception as e:
-            kb_status = f"error: {str(e)}"
-            kb_count = 0
-        
+        mcp_server = get_mcp_server()
         return {
             "status": "running",
-            "server_type": "knowledge_base_mcp_server",
-            "knowledge_base_status": kb_status,
-            "knowledge_base_count": kb_count,
-            "available": KnowledgeBaseServer is not None
+            "protocol": "MCP",
+            "transport": "http_sse",
+            "active_sessions": len(_mcp_sessions),
+            "version": "1.0.0",
+            "server_info": {
+                "name": "Yuxi-Know Knowledge Base MCP Server",
+                "version": "1.0.0"
+            }
         }
-        
     except Exception as e:
-        logger.error(f"Error getting MCP server status: {e}")
+        logger.error(f"Error getting MCP status: {e}")
         return {
             "status": "error",
             "error": str(e),
-            "available": False
+            "protocol": "MCP",
+            "transport": "http_sse"
         }
+
+
+@mcp.delete("/session/{session_id}")
+async def close_mcp_session(session_id: str):
+    """Close a MCP session (Standard MCP endpoint)"""
+    if session_id in _mcp_sessions:
+        del _mcp_sessions[session_id]
+        return {"status": "closed", "session_id": session_id}
+    else:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+
+# =============================================================================
+# === Legacy Compatibility Endpoints (Deprecated) ===
+# =============================================================================
+
+@mcp.get("/legacy/info")
+async def get_legacy_info():
+    """Information about legacy endpoints (for migration purposes)"""
+    return {
+        "message": "Legacy REST API endpoints have been deprecated",
+        "migration_guide": {
+            "old_endpoints": [
+                "GET /mcp/tools",
+                "POST /mcp/tools/call", 
+                "POST /mcp/query",
+                "GET /mcp/knowledge-bases"
+            ],
+            "new_approach": "Use standard MCP protocol with JSON-RPC messages",
+            "steps": [
+                "1. Create session: POST /mcp/session",
+                "2. Send JSON-RPC messages: POST /mcp/message/{session_id}",
+                "3. Listen to events: GET /mcp/events/{session_id}",
+                "4. Close session: DELETE /mcp/session/{session_id}"
+            ]
+        },
+        "mcp_protocol_info": {
+            "specification": "https://modelcontextprotocol.io/",
+            "transport": "HTTP + Server-Sent Events",
+            "message_format": "JSON-RPC 2.0"
+        }
+    }
