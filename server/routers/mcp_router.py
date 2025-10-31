@@ -103,7 +103,7 @@ async def handle_mcp_request(message: MCPMessage) -> Optional[MCPMessage]:
             )
         
         # Handle tools/list
-        elif message.method == "tools-list":
+        elif message.method == "tools/list":
             tools = [
                 {
                     "name": "query_knowledge_base",
