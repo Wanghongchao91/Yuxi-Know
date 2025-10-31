@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, Field
 
-from src.utils.logger import logger
+from src.utils.logging_config import logger
 
 # Import MCP server functionality
 try:
