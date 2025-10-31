@@ -38,7 +38,7 @@ try:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
     
-    from src.knowledge.manager import knowledge_base
+    from src.knowledge import knowledge_base
     from src.utils import logger as app_logger
 except ImportError as e:
     logger.error(f"Failed to import knowledge base modules: {e}")

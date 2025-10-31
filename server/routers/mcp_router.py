@@ -11,7 +11,7 @@ from src.utils import logger
 # Import MCP server functionality
 try:
     from src.mcp_servers.knowledge_base_server import KnowledgeBaseServer
-    from src.knowledge.manager import knowledge_base
+    from src.knowledge import knowledge_base
 except ImportError as e:
     logger.error(f"Failed to import MCP server modules: {e}")
     KnowledgeBaseServer = None
