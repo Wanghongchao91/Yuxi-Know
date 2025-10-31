@@ -2,7 +2,7 @@ import asyncio
 import json
 import uuid
 import traceback
-from typing import Any, Dict, Optional, List, AsyncGenerator
+from typing import Any, Dict, Optional, List, AsyncGenerator, Union
 from datetime import datetime
 
 from fastapi import APIRouter, Request, HTTPException, Header
@@ -33,7 +33,7 @@ _mcp_server_instance = None
 class MCPMessage(BaseModel):
     """Standard MCP JSON-RPC Message"""
     jsonrpc: str = Field(default="2.0", description="JSON-RPC version")
-    id: Optional[str] = Field(default=None, description="Request ID")
+    id: Optional[Union[str, int, float]] = Field(default=None, description="Request ID")
     method: Optional[str] = Field(default=None, description="Method name")
     params: Optional[Dict[str, Any]] = Field(default=None, description="Method parameters")
     result: Optional[Any] = Field(default=None, description="Result for successful response")
