@@ -264,13 +264,13 @@ async def mcp_streamable_http_endpoint(
     accept: Optional[str] = Header(None)
 ):
     """
-    Standard MCP Streamable HTTP endpoint
+    Standard MCP Streamable HTTP endpoint - Updated for 2025-03-26 specification
     
     This endpoint implements the official MCP Streamable HTTP transport:
-    - GET: Establishes SSE stream for server-to-client communication  
+    - GET: Returns endpoint information or upgrades to SSE for streaming
     - POST: Handles client-to-server JSON-RPC messages
     
-    Reference: https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/
+    Reference: https://spec.modelcontextprotocol.io/specification/2025-03-26/basic/transports/
     """
     try:
         if not MCP_AVAILABLE:
@@ -286,82 +286,104 @@ async def mcp_streamable_http_endpoint(
             )
         
         if request.method == "GET":
-            # Handle SSE stream establishment for server-to-client communication
-            if not accept or "text/event-stream" not in accept:
-                return JSONResponse(
-                    status_code=406,
-                    content={
-                        "jsonrpc": "2.0", 
-                        "error": {
-                            "code": -32602,
-                            "message": "Accept header must include text/event-stream for SSE"
+            # Check if client wants to upgrade to SSE for streaming
+            accept_header = request.headers.get("accept", "")
+            
+            if "text/event-stream" in accept_header:
+                # Client wants SSE streaming - establish streamable connection
+                logger.info("MCP Streamable HTTP GET request - upgrading to SSE stream")
+                
+                # Generate unique session ID for this stream
+                session_id = str(uuid.uuid4())
+                
+                async def sse_event_generator() -> AsyncGenerator[Dict[str, str], None]:
+                    """Generate SSE events for MCP server-to-client communication"""
+                    try:
+                        logger.info(f"MCP SSE stream established: {session_id}")
+                        
+                        # Send initial connection event
+                        yield {
+                            "event": "connected",
+                            "data": json.dumps({
+                                "sessionId": session_id,
+                                "timestamp": datetime.now().isoformat(),
+                                "protocol": "MCP",
+                                "version": "2024-11-05"
+                            })
                         }
+                        
+                        # Keep stream alive and handle server-initiated messages
+                        message_count = 0
+                        while True:
+                            try:
+                                # Wait for any server-initiated events or keepalive
+                                await asyncio.sleep(30.0)  # 30-second keepalive interval
+                                
+                                # Send periodic ping to keep connection alive
+                                message_count += 1
+                                yield {
+                                    "event": "ping",
+                                    "data": json.dumps({
+                                        "timestamp": datetime.now().isoformat(),
+                                        "messageCount": message_count
+                                    })
+                                }
+                                
+                            except asyncio.CancelledError:
+                                logger.info(f"MCP SSE stream cancelled: {session_id}")
+                                break
+                            except Exception as e:
+                                logger.error(f"Error in MCP SSE stream: {e}")
+                                yield {
+                                    "event": "error", 
+                                    "data": json.dumps({
+                                        "error": str(e),
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                                }
+                                break
+                                
+                    except Exception as e:
+                        logger.error(f"Fatal error in MCP SSE generator: {e}")
+                        yield {
+                            "event": "error",
+                            "data": json.dumps({
+                                "error": f"Fatal SSE error: {str(e)}",
+                                "timestamp": datetime.now().isoformat()
+                            })
+                        }
+                    finally:
+                        logger.info(f"MCP SSE stream closed: {session_id}")
+                
+                # Return SSE response with session ID header
+                response = EventSourceResponse(sse_event_generator())
+                response.headers["Mcp-Session-Id"] = session_id
+                response.headers["Cache-Control"] = "no-cache"
+                return response
+                
+            else:
+                # Client wants basic endpoint info (non-streaming)
+                logger.info("MCP Streamable HTTP GET request - returning endpoint info")
+                return JSONResponse(
+                    status_code=200,
+                    content={
+                        "protocol": "Model Context Protocol",
+                        "version": "2024-11-05",
+                        "transport": "Streamable HTTP",
+                        "endpoints": {
+                            "mcp": "/api/mcp",
+                            "status": "/api/mcp/status"
+                        },
+                        "capabilities": {
+                            "streaming": True,
+                            "sse_upgrade": True
+                        }
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cache-Control": "no-cache"
                     }
                 )
-            
-            # Generate unique session ID for this stream
-            session_id = str(uuid.uuid4())
-            
-            async def sse_event_generator() -> AsyncGenerator[Dict[str, str], None]:
-                """Generate SSE events for MCP server-to-client communication"""
-                try:
-                    logger.info(f"MCP SSE stream established: {session_id}")
-                    
-                    # Send initial connection event
-                    yield {
-                        "event": "connected",
-                        "data": json.dumps({
-                            "sessionId": session_id,
-                            "timestamp": datetime.now().isoformat(),
-                            "protocol": "MCP",
-                            "version": "2024-11-05"
-                        })
-                    }
-                    
-                    # Keep stream alive and handle server-initiated messages
-                    message_count = 0
-                    while True:
-                        try:
-                            # Wait for any server-initiated events or keepalive
-                            await asyncio.sleep(30.0)  # 30-second keepalive interval
-                            
-                            # Send periodic ping to keep connection alive
-                            message_count += 1
-                            yield {
-                                "event": "ping",
-                                "data": json.dumps({
-                                    "timestamp": datetime.now().isoformat(),
-                                    "messageCount": message_count
-                                })
-                            }
-                            
-                        except asyncio.CancelledError:
-                            logger.info(f"MCP SSE stream cancelled: {session_id}")
-                            break
-                        except Exception as e:
-                            logger.error(f"Error in MCP SSE stream: {e}")
-                            yield {
-                                "event": "error", 
-                                "data": json.dumps({
-                                    "error": str(e),
-                                    "timestamp": datetime.now().isoformat()
-                                })
-                            }
-                            break
-                            
-                except Exception as e:
-                    logger.error(f"Fatal error in MCP SSE generator: {e}")
-                    yield {
-                        "event": "error",
-                        "data": json.dumps({
-                            "error": f"Fatal SSE error: {str(e)}",
-                            "timestamp": datetime.now().isoformat()
-                        })
-                    }
-                finally:
-                    logger.info(f"MCP SSE stream closed: {session_id}")
-            
-            return EventSourceResponse(sse_event_generator())
         
         elif request.method == "POST":
             # Handle JSON-RPC message from client to server
@@ -429,14 +451,31 @@ async def mcp_streamable_http_endpoint(
                 # This was a notification - return 202 Accepted with no content
                 return JSONResponse(
                     status_code=202,
-                    content={"status": "accepted"}
+                    content={"status": "accepted"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cache-Control": "no-cache"
+                    }
                 )
             else:
                 # Return the JSON-RPC response
-                return JSONResponse(
+                json_response = JSONResponse(
                     status_code=200,
-                    content=response.dict(exclude_none=True)
+                    content=response.dict(exclude_none=True),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Cache-Control": "no-cache"
+                    }
                 )
+                
+                # Add session ID if this is an initialize response
+                if mcp_message.method == "initialize" and hasattr(response, 'result'):
+                    # Generate session ID for new initialization
+                    session_id = str(uuid.uuid4())
+                    json_response.headers["Mcp-Session-Id"] = session_id
+                    logger.info(f"MCP session initialized: {session_id}")
+                
+                return json_response
         
         else:
             # This should never happen due to FastAPI routing, but handle defensively

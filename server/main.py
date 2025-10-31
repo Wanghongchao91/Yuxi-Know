@@ -27,13 +27,14 @@ _attempt_lock = asyncio.Lock()
 app = FastAPI(lifespan=lifespan)
 app.include_router(router, prefix="/api")
 
-# CORS 设置
+# CORS 设置 - 优化MCP支持
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id", "Content-Type"],  # 暴露MCP会话ID头部
 )
 
 
