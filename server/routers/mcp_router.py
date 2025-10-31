@@ -17,7 +17,7 @@ try:
     from mcp.server import Server
     from mcp.types import JSONRPCRequest, JSONRPCNotification, JSONRPCMessage
     from src.mcp_servers.knowledge_base_server import KnowledgeBaseServer
-    from src.knowledge_base import knowledge_base
+    from src.knowledge import knowledge_base
     MCP_AVAILABLE = True
 except ImportError as e:
     logger.error(f"Failed to import MCP server modules: {e}")
