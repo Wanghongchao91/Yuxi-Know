@@ -288,20 +288,6 @@ class MCPRequestHandler:
         
         try:
             if tool_name == "query_knowledge_base":
-                # Validate db_id if provided
-                db_id = arguments.get("db_id")
-                if db_id:
-                    # First check if knowledge bases are available
-                    available_kbs = await self.mcp_server._list_knowledge_bases()
-                    if hasattr(available_kbs, 'content') and available_kbs.content:
-                        kb_list = json.loads(available_kbs.content[0].text) if available_kbs.content[0].text else []
-                        if isinstance(kb_list, list) and not any(kb.get('id') == db_id for kb in kb_list):
-                            return create_jsonrpc_error_response(
-                                ErrorCode.INVALID_PARAMS,
-                                f"Database ID '{db_id}' not found. Use list_knowledge_bases to get available database IDs.",
-                                message.id
-                            )
-                
                 result = await self.mcp_server._query_knowledge_base(arguments)
             elif tool_name == "list_knowledge_bases":
                 result = await self.mcp_server._list_knowledge_bases()
@@ -325,8 +311,23 @@ class MCPRequestHandler:
     def _format_tool_result(self, result: Any, request_id: Optional[Any]) -> MCPMessage:
         """Format tool execution result according to MCP standard"""
         content = []
+        is_error = False
         
-        if hasattr(result, 'content') and result.content:
+        # Handle CallToolResult from MCP server
+        if hasattr(result, 'content') and hasattr(result, 'isError'):
+            # This is a CallToolResult object
+            is_error = getattr(result, 'isError', False)
+            if result.content:
+                for item in result.content:
+                    if hasattr(item, 'text') and hasattr(item, 'type'):
+                        # This is likely a TextContent or similar MCP content object
+                        content.append({"type": item.type, "text": item.text})
+                    elif isinstance(item, dict):
+                        content.append(item)
+                    else:
+                        content.append({"type": "text", "text": str(item)})
+        elif hasattr(result, 'content') and result.content:
+            # Handle other content formats
             for item in result.content:
                 if hasattr(item, 'text'):
                     content.append({"type": "text", "text": item.text})
@@ -335,16 +336,28 @@ class MCPRequestHandler:
                 else:
                     content.append({"type": "text", "text": str(item)})
         else:
+            # Handle simple results
             content.append({
                 "type": "text",
                 "text": str(result) if result else "Tool executed successfully"
             })
         
+        # If this is an error result, return it as an error response
+        if is_error:
+            return MCPMessage(
+                id=request_id,
+                error={
+                    "code": -32603,
+                    "message": "Tool execution failed",
+                    "data": {"content": content}
+                }
+            )
+        
         return MCPMessage(
             id=request_id,
             result={
                 "content": content,
-                "isError": False
+                "isError": is_error
             }
         )
     

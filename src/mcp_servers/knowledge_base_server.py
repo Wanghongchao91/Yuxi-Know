@@ -263,20 +263,46 @@ class KnowledgeBaseServer:
                 result = all_results[:top_k]  # Limit total results
                 source_info = f"Searched {len(retrievers)} databases"
             
-            # Pass through original results without extra formatting
+            # Handle empty or invalid results
+            if result is None:
+                result = []
+            elif isinstance(result, str):
+                # If result is already a string, try to parse it as JSON
+                try:
+                    parsed_result = json.loads(result)
+                    result = parsed_result
+                except json.JSONDecodeError:
+                    # If it's not valid JSON, wrap it in a simple structure
+                    result = [{"text": result, "type": "text"}]
+            
+            # Ensure result is JSON-serializable
+            try:
+                result_text = json.dumps(result, ensure_ascii=False)
+            except (TypeError, ValueError) as json_error:
+                # If result can't be JSON serialized, convert to string representation
+                result_text = str(result)
+                logger.warning(f"Result could not be JSON serialized, using string representation: {json_error}")
+            
             return CallToolResult(
                 content=[TextContent(
                     type="text",
-                    text=json.dumps(result, ensure_ascii=False)
+                    text=result_text
                 )]
             )
             
         except Exception as e:
-            logger.error(f"Error in _query_knowledge_base: {e}")
+            logger.error(f"Error in _query_knowledge_base: {e}", exc_info=True)
+            error_msg = f"Error querying knowledge base: {str(e)}"
+            if "Expecting value" in str(e):
+                error_msg += "\n\nThis usually means the knowledge base returned empty or invalid results. Try:\n"
+                error_msg += "1. Check if the database ID is correct using list_knowledge_bases\n"
+                error_msg += "2. Try a different search term\n"
+                error_msg += "3. Use a different query mode (local, global, hybrid, naive, mix)"
+            
             return CallToolResult(
                 content=[TextContent(
                     type="text",
-                    text=f"Error querying knowledge base: {str(e)}"
+                    text=error_msg
                 )],
                 isError=True
             )
