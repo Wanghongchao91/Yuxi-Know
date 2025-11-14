@@ -1,5 +1,9 @@
 <template>
   <div class="input-box" :class="[customClasses, { 'single-line': isSingleLine }]" @click="focusInput">
+    <div class="top-slot">
+      <slot name="top"></slot>
+    </div>
+
     <div class="expand-options" v-if="hasOptionsLeft">
       <a-popover
         v-model:open="optionsExpanded"
@@ -7,15 +11,12 @@
         trigger="click"
       >
         <template #content>
-          <div class="popover-options">
-            <slot name="options-left">
-              <div class="no-options">没有配置 options</div>
-            </slot>
-          </div>
+          <slot name="options-left">
+            <div class="no-options">没有配置 options</div>
+          </slot>
         </template>
         <a-button
           type="text"
-          size="small"
           class="expand-btn"
         >
           <template #icon>
@@ -23,6 +24,7 @@
           </template>
         </a-button>
       </a-popover>
+      <slot name="actions-left"></slot>
     </div>
 
     <textarea
@@ -37,6 +39,7 @@
     />
 
     <div class="send-button-container">
+      <slot name="actions-right"></slot>
       <a-tooltip :title="isLoading ? '停止回答' : ''">
         <a-button
           @click="handleSendOrStop"
@@ -49,6 +52,10 @@
           </template>
         </a-button>
       </a-tooltip>
+    </div>
+
+    <div class="bottom-slot">
+      <slot name="bottom"></slot>
     </div>
   </div>
 </template>
@@ -116,6 +123,15 @@ const hasOptionsLeft = computed(() => {
   return Boolean(renderedNodes && renderedNodes.length);
 });
 
+const hasActionsLeft = computed(() => {
+  const slot = slots['actions-left'];
+  if (!slot) {
+    return false;
+  }
+  const renderedNodes = slot();
+  return Boolean(renderedNodes && renderedNodes.length);
+});
+
 // 图标映射
 const iconComponents = {
   'SendOutlined': SendOutlined,
@@ -136,6 +152,7 @@ const inputValue = computed({
   get: () => props.modelValue,
   set: (val) => emit('update:modelValue', val)
 });
+
 
 // 处理键盘事件
 const handleKeyPress = (e) => {
@@ -262,6 +279,14 @@ onBeforeUnmount(() => {
   }
 });
 
+// 公开方法供父组件调用
+defineExpose({
+  focus: () => inputRef.value?.focus(),
+  closeOptions: () => {
+    optionsExpanded.value = false;
+  }
+});
+
 </script>
 
 <style lang="less" scoped>
@@ -273,21 +298,42 @@ onBeforeUnmount(() => {
   border-radius: 0.8rem;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
   transition: all 0.3s ease;
-  gap: 8px;
+  gap: 0px;
 
-  /* Default: Multi-line layout */
+  /* Default: Multi-line layout with top/bottom slots */
   padding: 0.8rem 0.75rem 0.6rem 0.75rem;
   grid-template-columns: auto 1fr;
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto auto;
   grid-template-areas:
+    "top top"
     "input input"
     "options send";
 
-  .expand-options {
-    justify-self: start;
+  .top-slot {
+    display: flex;
+    grid-area: top;
   }
+
+  .expand-options {
+    grid-area: options;
+    justify-self: start;
+    display: flex;
+    align-items: center;
+    margin-right: 8px;
+    gap: 8px;
+  }
+
+  .user-input {
+    grid-area: input;
+  }
+
   .send-button-container {
+    grid-area: send;
     justify-self: end;
+  }
+
+  .bottom-slot {
+    grid-column: 1 / -1;
   }
 
   // &:focus-within {
@@ -299,9 +345,13 @@ onBeforeUnmount(() => {
   &.single-line {
     padding: 0.75rem 0.75rem;
     grid-template-columns: auto 1fr auto;
-    grid-template-rows: 1fr;
-    grid-template-areas: "options input send";
+    grid-template-rows: auto 1fr auto;
+    grid-template-areas:
+      "top top top"
+      "options input send"
+      "bottom bottom bottom";
     align-items: center;
+    gap: 0px;
 
     .user-input {
       min-height: 24px;
@@ -313,6 +363,20 @@ onBeforeUnmount(() => {
 
     .expand-options, .send-button-container {
       align-self: center;
+    }
+
+    .expand-options {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .top-slot {
+      grid-area: top;
+    }
+
+    .bottom-slot {
+      grid-area: bottom;
     }
   }
 }
@@ -357,23 +421,29 @@ onBeforeUnmount(() => {
 }
 
 .expand-btn {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
   display: flex;
   align-items: center;
   justify-content: center;
   color: var(--gray-600);
   transition: all 0.2s ease;
+  border: 1px solid transparent;
+  background-color: transparent;
 
   &:hover {
-    background-color: var(--gray-100);
-    color: var(--main-500);
+    color: var(--main-color);
+  }
+
+  &:active {
+    color: var(--main-color);
+    transform: scale(0.95);
   }
 
   .anticon {
-    font-size: 12px;
-    transition: transform 0.2s ease;
+    font-size: 14px;
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 
     &.rotated {
       transform: rotate(45deg);
@@ -383,34 +453,34 @@ onBeforeUnmount(() => {
 
 // Popover 选项样式
 .popover-options {
-  min-width: 200px;
-  max-width: 300px;
+  min-width: 160px;
+  max-width: 200px;
+  padding: 4px;
 
   .no-options {
-    color: var(--gray-700);
+    color: var(--gray-500);
     font-size: 12px;
     text-align: center;
+    padding: 12px 8px;
   }
 
   :deep(.opt-item) {
-    border-radius: 12px;
-    border: 1px solid var(--gray-300);
-    padding: 5px 10px;
+    border-radius: 8px;
+    padding: 6px 10px;
     cursor: pointer;
     font-size: 12px;
     color: var(--gray-700);
     transition: all 0.2s ease;
-    margin: 4px;
+    margin: 2px;
     display: inline-block;
 
     &:hover {
       background-color: var(--main-10);
-      color: var(--main-color);
+      color: var(--main-600);
     }
 
     &.active {
-      color: var(--main-color);
-      border: 1px solid var(--main-500);
+      color: var(--main-600);
       background-color: var(--main-10);
     }
   }
@@ -444,12 +514,13 @@ onBeforeUnmount(() => {
   }
 
   &:disabled {
-    background-color: var(--gray-400);
+    opacity: 0.5;
     cursor: not-allowed;
     transform: none;
     box-shadow: none;
   }
 }
+
 
 @media (max-width: 520px) {
   .input-box {

@@ -1,73 +1,11 @@
 <template>
-  <div class="graph-section" :class="{ collapsed: !visible }" :style="style" v-if="isGraphSupported">
-    <div class="section-header">
-      <div class="header-left">
-        <h3 class="section-title">知识图谱</h3>
-        <div v-if="graphStats.displayed_nodes > 0 || graphStats.displayed_edges > 0" class="graph-stats">
-          <a-tag color="blue" size="small">节点: {{ graphStats.displayed_nodes }}</a-tag>
-          <a-tag color="green" size="small">边: {{ graphStats.displayed_edges }}</a-tag>
-          <!-- <a-tag v-if="graphStats.is_truncated" color="red" size="small">已截断</a-tag> -->
-        </div>
-      </div>
-      <div class="panel-actions">
-        <a-button
-          type="primary"
-          size="small"
-          @click="loadGraph"
-          :disabled="!isGraphSupported"
-          :icon='h(ReloadOutlined)'
-        >
-          加载图谱
-        </a-button>
-        <!-- 导出功能暂禁，等待 LightRAG 库修复
-        <a-button
-          type="primary"
-          size="small"
-          @click="showExportModal = true"
-          :disabled="!isGraphSupported"
-        >
-          导出图谱
-        </a-button>
-        -->
-        <!-- <a-button
-          type="text"
-          size="small"
-          @click="showSettings = true"
-        >
-          <SettingOutlined />
-          参数
-        </a-button> -->
-        <!-- <a-button
-          type="text"
-          size="small"
-          :icon="h(DeleteOutlined)"
-          title="清空"
-          @click="clearGraph"
-          :disabled="!isGraphSupported"
-        >
-          清空
-        </a-button> -->
-        <a-button
-          type="text"
-          size="small"
-          :icon="h(ExpandOutlined)"
-          title="最大化"
-          @click="toggleGraphMaximize"
-          :disabled="!isGraphSupported"
-        >
-          最大化
-        </a-button>
-        <a-button
-          type="text"
-          size="small"
-          @click="toggleVisible"
-          title="折叠/展开"
-        >
-          <component :is="visible ? UpOutlined : DownOutlined" />
-        </a-button>
+  <div class="graph-section" v-if="isGraphSupported">
+    <div class="graph-toolbar">
+      <div class="toolbar-left">
+        <!-- 移除了不准确的总节点数和总边数显示 -->
       </div>
     </div>
-    <div class="graph-container-compact content" v-show="visible">
+    <div class="graph-container-compact">
       <div v-if="!isGraphSupported" class="graph-disabled">
         <div class="disabled-content">
           <h4>知识图谱不可用</h4>
@@ -79,11 +17,8 @@
         v-else
         :initial-database-id="databaseId"
         :hide-db-selector="true"
-        :hide-stats="true"
-        :hide-controls="!store.state.isGraphMaximized"
         :initial-limit="graphLimit"
         :initial-depth="graphDepth"
-        @update:stats="handleStatsUpdate"
         ref="graphViewerRef"
       />
     </div>
@@ -151,44 +86,29 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useDatabaseStore } from '@/stores/database';
-import { useUserStore } from '@/stores/user';
-import { ReloadOutlined, DeleteOutlined, ExpandOutlined, UpOutlined, DownOutlined, SettingOutlined } from '@ant-design/icons-vue';
-import { message } from 'ant-design-vue';
+import { ReloadOutlined } from '@ant-design/icons-vue';
 import KnowledgeGraphViewer from '@/components/KnowledgeGraphViewer.vue';
 import { h } from 'vue';
-
-const store = useDatabaseStore();
-const userStore = useUserStore();
+import { getKbTypeLabel } from '@/utils/kb_utils';
 
 const props = defineProps({
-  visible: {
+  active: {
     type: Boolean,
-    default: true
-  },
-  style: {
-    type: Object,
-    default: () => ({})
+    default: false,
   },
 });
 
-// 添加调试日志
-console.log('KnowledgeGraphSection props:', props);
-console.log('KnowledgeGraphSection style prop:', props.style);
-
-const emit = defineEmits(['toggleVisible']);
+const store = useDatabaseStore();
 
 const databaseId = computed(() => store.databaseId);
 const kbType = computed(() => store.database.kb_type);
-const graphStats = computed({
-    get: () => store.graphStats,
-    set: (stats) => store.graphStats = stats
-});
+const kbTypeLabel = computed(() => getKbTypeLabel(kbType.value || 'lightrag'));
 
 const graphViewerRef = ref(null);
 const showSettings = ref(false);
-const graphLimit = ref(200);
+const graphLimit = ref(50);
 const graphDepth = ref(2);
 
 const showExportModal = ref(false);
@@ -203,16 +123,26 @@ const isGraphSupported = computed(() => {
   return type === 'lightrag';
 });
 
-const toggleVisible = () => {
-  emit('toggleVisible');
-};
+let pendingLoadTimer = null;
 
-const loadGraph = () => {
-  if (!(Object.keys(store.database?.files).length > 0)) {
-    return;
-  }
+const loadGraph = async () => {
+  console.log('loadGraph 调用:', {
+    hasRef: !!graphViewerRef.value,
+    hasLoadFullGraph: graphViewerRef.value && typeof graphViewerRef.value.loadFullGraph === 'function'
+  });
+
+  // 等待一小段时间确保子组件已经完全初始化
+  await nextTick();
+
   if (graphViewerRef.value && typeof graphViewerRef.value.loadFullGraph === 'function') {
+    console.log('调用 loadFullGraph');
     graphViewerRef.value.loadFullGraph();
+  } else {
+    console.warn('无法调用 loadFullGraph:', {
+      hasRef: !!graphViewerRef.value,
+      refValue: graphViewerRef.value,
+      hasMethod: graphViewerRef.value && typeof graphViewerRef.value.loadFullGraph
+    });
   }
 };
 
@@ -220,14 +150,6 @@ const clearGraph = () => {
   if (graphViewerRef.value && typeof graphViewerRef.value.clearGraph === 'function') {
     graphViewerRef.value.clearGraph();
   }
-};
-
-const toggleGraphMaximize = () => {
-  store.state.isGraphMaximized = !store.state.isGraphMaximized;
-};
-
-const handleStatsUpdate = (stats) => {
-  graphStats.value = stats;
 };
 
 const applySettings = () => {
@@ -281,49 +203,134 @@ const applySettings = () => {
 //   }
 // };
 
-watch(isGraphSupported, (supported) => {
-    if (supported) {
-        setTimeout(() => {
-            loadGraph();
-        }, 800);
+const scheduleGraphLoad = (delay = 200) => {
+  console.log('scheduleGraphLoad 调用:', {
+    active: props.active,
+    supported: isGraphSupported.value,
+    databaseId: databaseId.value,
+    hasGraphViewer: !!graphViewerRef.value
+  });
+
+  // 确保组件激活且数据库支持图谱功能
+  if (!props.active) {
+    console.log('组件未激活，跳过图谱加载');
+    return;
+  }
+
+  if (!isGraphSupported.value) {
+    console.log('数据库不支持图谱功能，跳过加载');
+    return;
+  }
+
+  if (!databaseId.value) {
+    console.log('没有选中数据库，跳过图谱加载');
+    return;
+  }
+
+  if (pendingLoadTimer) {
+    clearTimeout(pendingLoadTimer);
+  }
+  pendingLoadTimer = setTimeout(async () => {
+    await nextTick();
+    // 再次检查条件，防止在延迟期间状态发生变化
+    if (props.active && isGraphSupported.value && databaseId.value) {
+      console.log('执行图谱加载');
+      await loadGraph();
+    } else {
+      console.log('延迟检查时条件不满足:', {
+        active: props.active,
+        supported: isGraphSupported.value,
+        databaseId: databaseId.value
+      });
     }
+  }, delay);
+};
+
+
+watch(
+  () => props.active,
+  (active) => {
+    if (active) {
+      scheduleGraphLoad();
+    }
+  },
+  { immediate: true }
+);
+
+watch(databaseId, () => {
+  clearGraph();
+
+  // 只有在新数据库支持图谱时才加载
+  if (isGraphSupported.value) {
+    scheduleGraphLoad(300);
+  }
+});
+
+watch(isGraphSupported, (supported) => {
+  if (!supported) {
+    clearGraph();
+    return;
+  }
+  scheduleGraphLoad(200);
+});
+
+onUnmounted(() => {
+  if (pendingLoadTimer) {
+    clearTimeout(pendingLoadTimer);
+    pendingLoadTimer = null;
+  }
 });
 
 </script>
 
 <style scoped lang="less">
 .graph-section {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 
-  .graph-container-compact {
-    flex: 1;
-    min-height: 0;
-    padding: 0;
-    height: 100%;
-    border-radius: 0;
-  }
+.graph-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background-color: #fff;
+  border-bottom: 1px solid var(--gray-200);
 
-  .graph-disabled {
+  .toolbar-left {
     display: flex;
-    justify-content: center;
     align-items: center;
-    height: 200px;
+    gap: 12px;
   }
 
-  .disabled-content {
-    text-align: center;
-    color: #8c8c8c;
-
-    h4 {
-      margin-bottom: 8px;
-    }
-  }
-
-  .content {
-    flex: 1;
-    min-height: 0;
+  .toolbar-right {
     display: flex;
-    flex-direction: column;
-    height: 100%;
+    align-items: center;
+    gap: 8px;
+  }
+}
+
+.graph-container-compact {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.graph-disabled {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+}
+
+.disabled-content {
+  text-align: center;
+  color: #8c8c8c;
+
+  h4 {
+    margin-bottom: 8px;
   }
 }
 </style>

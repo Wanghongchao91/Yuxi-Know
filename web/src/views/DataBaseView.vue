@@ -90,6 +90,65 @@
           <InfoCircleOutlined style="margin-left: 8px; color: var(--gray-500); cursor: help;" />
         </a-tooltip>
       </div>
+
+      <div
+        v-if="['chroma', 'milvus'].includes(newDatabase.kb_type)"
+        class="reranker-config"
+      >
+        <div class="reranker-row">
+          <div class="reranker-title">
+            <span>启用重排序</span>
+            <a-tooltip title="向量检索后使用交叉编码模型对候选文档重新排序，提升召回质量。">
+              <QuestionCircleOutlined class="hint-icon" />
+            </a-tooltip>
+          </div>
+          <a-switch
+            v-model:checked="newDatabase.reranker.enabled"
+            :disabled="rerankerOptions.length === 0"
+          />
+        </div>
+
+        <transition name="fade">
+          <div v-if="newDatabase.reranker.enabled" class="reranker-form">
+            <div class="form-field">
+              <label>重排序模型</label>
+              <a-select
+                v-model:value="newDatabase.reranker.model"
+                :options="rerankerOptions"
+                placeholder="选择重排序模型"
+                :disabled="rerankerOptions.length === 0"
+              />
+              <p class="field-hint" v-if="rerankerOptions.length === 0">
+                暂无可用模型，请在系统配置中添加。
+              </p>
+            </div>
+
+            <div class="form-grid">
+              <div class="form-field">
+                <label>召回数量</label>
+                <a-input-number
+                  v-model:value="newDatabase.reranker.recall_top_k"
+                  :min="10"
+                  :max="200"
+                  :step="5"
+                  style="width: 100%;"
+                />
+                <p class="field-hint">向量检索阶段保留的候选数量</p>
+              </div>
+              <div class="form-field">
+                <label>最终返回数</label>
+                <a-input-number
+                  v-model:value="newDatabase.reranker.final_top_k"
+                  :min="1"
+                  :max="100"
+                  style="width: 100%;"
+                />
+                <p class="field-hint">重排序后返回给前端的文档数量</p>
+              </div>
+            </div>
+          </div>
+        </transition>
+      </div>
       <template #footer>
         <a-button key="back" @click="cancelCreateDatabase">取消</a-button>
         <a-button key="submit" type="primary" :loading="state.creating" @click="createDatabase">创建</a-button>
@@ -104,15 +163,6 @@
 
     <!-- 数据库列表 -->
     <div v-else class="databases">
-      <div class="new-database dbcard" @click="state.openNewDatabaseModel=true">
-        <div class="top">
-          <div class="icon"><BookPlus /></div>
-          <div class="info">
-            <h3>新建知识库</h3>
-          </div>
-        </div>
-        <p>导入您自己的文本数据或通过Webhook实时写入数据以增强 LLM 的上下文。</p>
-      </div>
       <div
         v-for="database in databases"
         :key="database.db_id"
@@ -165,8 +215,8 @@ import { ref, onMounted, reactive, watch, computed } from 'vue'
 import { useRouter, useRoute } from 'vue-router';
 import { useConfigStore } from '@/stores/config';
 import { message } from 'ant-design-vue'
-import { BookPlus, Database, Zap, FileDigit,  Waypoints, Building2 } from 'lucide-vue-next';
-import { LockOutlined, InfoCircleOutlined } from '@ant-design/icons-vue';
+import { Database, Zap, FileDigit,  Waypoints, Building2 } from 'lucide-vue-next';
+import { LockOutlined, InfoCircleOutlined, QuestionCircleOutlined } from '@ant-design/icons-vue';
 import { databaseApi, typeApi } from '@/apis/knowledge_api';
 import HeaderComponent from '@/components/HeaderComponent.vue';
 import ModelSelectorComponent from '@/components/ModelSelectorComponent.vue';
@@ -205,25 +255,36 @@ const languageOptions = [
   { label: '印地语 Hindi', value: 'Hindi' },
 ]
 
-const emptyEmbedInfo = {
+const createEmptyDatabaseForm = () => ({
   name: '',
   description: '',
   embed_model_name: configStore.config?.embed_model,
-  kb_type: 'chroma', // 默认为 Milvus
-  is_private: false, // 默认为公开知识库
-  // Vector 知识库特有配置
-  storage: '', // 存储方式配置
-  // LightRAG 特有配置
+  kb_type: 'chroma',
+  is_private: false,
+  storage: '',
   language: 'English',
   llm_info: {
     provider: '',
     model_name: ''
   },
-}
-
-const newDatabase = reactive({
-  ...emptyEmbedInfo,
+  reranker: {
+    enabled: false,
+    model: '',
+    recall_top_k: 50,
+    final_top_k: 10,
+  }
 })
+
+const newDatabase = reactive(createEmptyDatabaseForm())
+
+const rerankerOptions = computed(() =>
+  Object.entries(configStore?.config?.reranker_names || {}).map(([value, info]) => ({
+    label: info?.name || value,
+    value
+  }))
+)
+
+const isVectorKb = computed(() => ['chroma', 'milvus'].includes(newDatabase.kb_type))
 
 const llmModelSpec = computed(() => {
   const provider = newDatabase.llm_info?.provider || ''
@@ -255,6 +316,8 @@ const loadSupportedKbTypes = async () => {
   }
 }
 
+// 重排序模型信息现在直接从 configStore.config.reranker_names 获取，无需单独加载
+
 const loadDatabases = () => {
   state.loading = true
   // loadGraph()
@@ -282,7 +345,7 @@ const loadDatabases = () => {
 }
 
 const resetNewDatabase = () => {
-  Object.assign(newDatabase, { ...emptyEmbedInfo })
+  Object.assign(newDatabase, createEmptyDatabaseForm())
 }
 
 const cancelCreateDatabase = () => {
@@ -380,6 +443,9 @@ const handleKbTypeChange = (type) => {
   console.log('知识库类型改变:', type)
   resetNewDatabase()
   newDatabase.kb_type = type
+  if (!['chroma', 'milvus'].includes(type)) {
+    newDatabase.reranker.enabled = false
+  }
 }
 
 // 处理LLM选择
@@ -420,7 +486,23 @@ const createDatabase = () => {
 
   // 添加类型特有的配置
   if (newDatabase.kb_type === 'chroma' || newDatabase.kb_type === 'milvus') {
-    requestData.additional_params.storage = newDatabase.storage || 'DemoA'
+    if (newDatabase.storage) {
+      requestData.additional_params.storage = newDatabase.storage
+    }
+
+    if (newDatabase.reranker.enabled) {
+      if (!newDatabase.reranker.model) {
+        message.error('请选择重排序模型')
+        state.creating = false
+        return
+      }
+      requestData.additional_params.reranker_config = {
+        enabled: true,
+        model: newDatabase.reranker.model,
+        recall_top_k: Number(newDatabase.reranker.recall_top_k) || 50,
+        final_top_k: Number(newDatabase.reranker.final_top_k) || 10,
+      }
+    }
   }
 
   if (newDatabase.kb_type === 'lightrag') {
@@ -455,6 +537,42 @@ const navigateToDatabase = (databaseId) => {
   router.push({ path: `/database/${databaseId}` });
 };
 
+watch(() => newDatabase.reranker.enabled, (enabled) => {
+  if (
+    enabled &&
+    !newDatabase.reranker.model &&
+    rerankerOptions.value.length > 0
+  ) {
+    newDatabase.reranker.model = rerankerOptions.value[0].value
+  }
+})
+
+watch(rerankerOptions, (options) => {
+  if (!newDatabase.reranker.enabled || options.length === 0) {
+    return
+  }
+  const exists = options.some(option => option.value === newDatabase.reranker.model)
+  if (!exists) {
+    newDatabase.reranker.model = options[0].value
+  }
+})
+
+watch(isVectorKb, (isVector) => {
+  if (!isVector) {
+    newDatabase.reranker.enabled = false
+  }
+})
+
+watch(
+  () => newDatabase.reranker.final_top_k,
+  (value) => {
+    if (!newDatabase.reranker.enabled) return
+    if (value > newDatabase.reranker.recall_top_k) {
+      newDatabase.reranker.recall_top_k = value
+    }
+  }
+)
+
 watch(() => route.path, (newPath, oldPath) => {
   if (newPath === '/database') {
     loadDatabases();
@@ -464,6 +582,7 @@ watch(() => route.path, (newPath, oldPath) => {
 onMounted(() => {
   loadSupportedKbTypes()
   loadDatabases()
+  // 重排序模型信息现在直接从 configStore 获取，无需单独加载
 })
 
 </script>
@@ -478,6 +597,65 @@ onMounted(() => {
     display: flex;
     align-items: center;
     margin-bottom: 12px;
+  }
+
+  .reranker-config {
+    border: 1px solid var(--gray-200);
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 16px;
+    background: #fafafa;
+
+    .reranker-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+
+      .reranker-title {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-weight: 500;
+        color: var(--gray-800);
+      }
+
+      .hint-icon {
+        color: var(--gray-500);
+        cursor: help;
+      }
+    }
+
+    .reranker-form {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+
+      .form-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 16px;
+
+        @media (max-width: 768px) {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      .form-field {
+        label {
+          display: block;
+          font-size: 14px;
+          margin-bottom: 8px;
+          color: var(--gray-700);
+        }
+
+        .field-hint {
+          margin-top: 6px;
+          font-size: 12px;
+          color: var(--gray-500);
+        }
+      }
+    }
   }
 
   .kb-type-cards {
@@ -690,10 +868,6 @@ onMounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 16px;
-
-  .new-database {
-    background-color: #F0F3F4;
-  }
 }
 
 .database, .graphbase {

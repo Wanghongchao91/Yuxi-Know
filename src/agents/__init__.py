@@ -3,11 +3,12 @@ import importlib
 import inspect
 from pathlib import Path
 
-from src.agents.common.base import BaseAgent
+from server.utils.singleton import SingletonMeta
+from src.agents.common import BaseAgent
 from src.utils import logger
 
 
-class AgentManager:
+class AgentManager(metaclass=SingletonMeta):
     def __init__(self):
         self._classes = {}
         self._instances = {}  # 存储已创建的 agent 实例

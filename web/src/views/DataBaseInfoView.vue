@@ -1,40 +1,5 @@
 <template>
 <div class="database-info-container">
-  <DatabaseHeader />
-
-  <!-- Maximize Graph Modal -->
-  <a-modal
-    v-model:open="isGraphMaximized"
-    :footer="null"
-    :closable="false"
-    width="100%"
-    wrap-class-name="full-modal"
-    :mask-closable="false"
-  >
-    <template #title>
-      <div class="maximized-graph-header">
-        <h3>知识图谱 (最大化)</h3>
-        <a-button type="text" @click="toggleGraphMaximize">
-          <CompressOutlined /> 退出最大化
-        </a-button>
-      </div>
-    </template>
-    <div class="maximized-graph-content">
-      <div v-if="!isGraphSupported" class="graph-disabled">
-        <div class="disabled-content">
-          <h4>知识图谱不可用</h4>
-          <p>当前知识库类型 "{{ getKbTypeLabel(database.kb_type || 'lightrag') }}" 不支持知识图谱功能。</p>
-          <p>只有 LightRAG 类型的知识库支持知识图谱。</p>
-        </div>
-      </div>
-      <KnowledgeGraphViewer
-        v-else-if="isGraphMaximized"
-        :initial-database-id="databaseId"
-        :hide-db-selector="true"
-      />
-    </div>
-  </a-modal>
-
   <FileDetailModal />
 
   <FileUploadModal
@@ -43,6 +8,7 @@
 
   <div class="unified-layout">
     <div class="left-panel" :style="{ width: leftPanelWidth + '%' }">
+      <KnowledgeBaseCard />
       <FileTable
         :right-panel-visible="state.rightPanelVisible"
         @show-add-files-modal="showAddFilesModal"
@@ -53,19 +19,24 @@
     <div class="resize-handle" ref="resizeHandle"></div>
 
     <div class="right-panel" :style="{ width: (100 - leftPanelWidth) + '%', display: store.state.rightPanelVisible ? 'flex' : 'none' }">
-      <KnowledgeGraphSection
-        :visible="panels.graph.visible"
-        :style="computePanelStyles().graph"
-        @toggle-visible="togglePanel('graph')"
-      />
-
-      <div class="resize-handle-horizontal" ref="resizeHandleHorizontal" v-show="panels.query.visible && panels.graph.visible"></div>
-
-      <QuerySection
-        :visible="panels.query.visible"
-        :style="computePanelStyles().query"
-        @toggle-visible="togglePanel('query')"
-      />
+      <a-tabs v-model:activeKey="activeTab" class="knowledge-tabs" :tabBarStyle="{ margin: 0, padding: '0 16px' }">
+        <a-tab-pane key="graph" tab="知识图谱" v-if="isGraphSupported">
+          <KnowledgeGraphSection
+            :visible="true"
+            :active="activeTab === 'graph'"
+            @toggle-visible="() => {}"
+          />
+        </a-tab-pane>
+        <a-tab-pane key="query" tab="检索测试">
+          <QuerySection
+            :visible="true"
+            @toggle-visible="() => {}"
+          />
+        </a-tab-pane>
+        <a-tab-pane key="config" tab="检索配置">
+          <SearchConfigTab :database-id="databaseId" />
+        </a-tab-pane>
+      </a-tabs>
     </div>
   </div>
 </div>
@@ -75,15 +46,13 @@
 import { onMounted, reactive, ref, watch, onUnmounted, computed } from 'vue';
 import { useRoute } from 'vue-router';
 import { useDatabaseStore } from '@/stores/database';
-import { getKbTypeLabel } from '@/utils/kb_utils';
-import { CompressOutlined } from '@ant-design/icons-vue';
-import KnowledgeGraphViewer from '@/components/KnowledgeGraphViewer.vue';
-import DatabaseHeader from '@/components/DatabaseHeader.vue';
+import KnowledgeBaseCard from '@/components/KnowledgeBaseCard.vue';
 import FileTable from '@/components/FileTable.vue';
 import FileDetailModal from '@/components/FileDetailModal.vue';
 import FileUploadModal from '@/components/FileUploadModal.vue';
 import KnowledgeGraphSection from '@/components/KnowledgeGraphSection.vue';
 import QuerySection from '@/components/QuerySection.vue';
+import SearchConfigTab from '@/components/SearchConfigTab.vue';
 
 const route = useRoute();
 const store = useDatabaseStore();
@@ -91,76 +60,64 @@ const store = useDatabaseStore();
 const databaseId = computed(() => store.databaseId);
 const database = computed(() => store.database);
 const state = computed(() => store.state);
-const isGraphMaximized = computed({
-    get: () => store.state.isGraphMaximized,
-    set: (val) => store.state.isGraphMaximized = val
-});
-
 // 计算属性：是否支持知识图谱
 const isGraphSupported = computed(() => {
   const kbType = database.value.kb_type?.toLowerCase();
   return kbType === 'lightrag';
 });
 
-// 面板可见性控制
-const panels = reactive({
-  query: { visible: true },
-  graph: { visible: true },
-});
+// Tab 切换逻辑 - 智能默认
+const activeTab = ref('query');
 
-// 添加调试日志
-console.log('Initial panels state:', panels);
 
-const togglePanel = (panel) => {
-  panels[panel].visible = !panels[panel].visible;
+const resetGraphStats = () => {
+  store.graphStats = {
+    total_nodes: 0,
+    total_edges: 0,
+    displayed_nodes: 0,
+    displayed_edges: 0,
+    is_truncated: false
+  };
 };
+
+
+// LightRAG 默认展示知识图谱
+watch(
+  () => [databaseId.value, isGraphSupported.value],
+  ([newDbId, supported], oldValue = []) => {
+    const [oldDbId, previouslySupported] = oldValue;
+
+    if (!newDbId) {
+      return;
+    }
+
+    if (newDbId && newDbId !== oldDbId) {
+      resetGraphStats();
+    } else if (!supported && previouslySupported) {
+      resetGraphStats();
+    }
+
+    if (supported && (newDbId !== oldDbId || previouslySupported === false || previouslySupported === undefined)) {
+      activeTab.value = 'graph';
+      return;
+    }
+
+    if (!supported && activeTab.value === 'graph') {
+      activeTab.value = 'query';
+    }
+  },
+  { immediate: true }
+);
 
 // 切换右侧面板显示/隐藏
 const toggleRightPanel = () => {
   store.state.rightPanelVisible = !store.state.rightPanelVisible;
 };
 
-// 拖拽调整大小
-const leftPanelWidth = ref(60);
+// 拖拽调整大小（仅水平方向）
+const leftPanelWidth = ref(50);
 const isDragging = ref(false);
 const resizeHandle = ref(null);
-
-const rightPanelHeight = reactive({ query: 50, graph: 50 });
-const isDraggingVertical = ref(false);
-const resizeHandleHorizontal = ref(null);
-
-// 计算面板样式的方法
-const computePanelStyles = () => {
-  const queryVisible = panels.query.visible;
-  const graphVisible = panels.graph.visible && isGraphSupported.value;
-
-  if (queryVisible && graphVisible) {
-    const styles = {
-      query: { height: rightPanelHeight.query + '%', flex: 'none' },
-      graph: { height: rightPanelHeight.graph + '%', flex: 'none' }
-    };
-    console.log('Computed panel styles:', styles);
-    return styles;
-  } else if (queryVisible && !graphVisible) {
-    return {
-      query: { height: '100%', flex: '1' },
-      graph: { height: '36px', flex: 'none' }
-    };
-  } else if (!queryVisible && graphVisible) {
-    return {
-      query: { height: '36px', flex: 'none' },
-      graph: { height: '100%', flex: '1' }
-    };
-  } else {
-    return {
-      query: { height: '36px', flex: 'none' },
-      graph: { height: '36px', flex: 'none' }
-    };
-  }
-};
-
-// 添加调试日志
-console.log('Panel styles computed:', computePanelStyles());
 
 // 添加文件弹窗
 const addFilesModalVisible = ref(false);
@@ -170,11 +127,7 @@ const showAddFilesModal = () => {
   addFilesModalVisible.value = true;
 };
 
-// 切换图谱最大化状态
-const toggleGraphMaximize = () => {
-  isGraphMaximized.value = !isGraphMaximized.value;
-};
-
+// 重置文件选中状态
 const resetFileSelectionState = () => {
   store.selectedRowKeys = [];
   store.selectedFile = null;
@@ -184,8 +137,9 @@ const resetFileSelectionState = () => {
 watch(() => route.params.database_id, async (newId) => {
     store.databaseId = newId;
     resetFileSelectionState();
+    resetGraphStats();
     store.stopAutoRefresh();
-    await store.getDatabaseInfo(newId);
+    await store.getDatabaseInfo(newId, false); // Explicitly load query params on initial load
     store.startAutoRefresh();
   },
   { immediate: true }
@@ -198,16 +152,10 @@ onMounted(() => {
   store.getDatabaseInfo();
   store.startAutoRefresh();
 
-  // 添加拖拽事件监听
+  // 添加拖拽事件监听（仅水平方向）
   if (resizeHandle.value) {
     resizeHandle.value.addEventListener('mousedown', handleMouseDown);
   }
-  if (resizeHandleHorizontal.value) {
-    resizeHandleHorizontal.value.addEventListener('mousedown', handleMouseDownHorizontal);
-  }
-
-  // 添加调试日志
-  console.log('Resize handles initialized', resizeHandle.value, resizeHandleHorizontal.value);
 });
 
 // 组件卸载时停止示例轮播
@@ -216,13 +164,8 @@ onUnmounted(() => {
   if (resizeHandle.value) {
     resizeHandle.value.removeEventListener('mousedown', handleMouseDown);
   }
-  if (resizeHandleHorizontal.value) {
-    resizeHandleHorizontal.value.removeEventListener('mousedown', handleMouseDownHorizontal);
-  }
   document.removeEventListener('mousemove', handleMouseMove);
   document.removeEventListener('mouseup', handleMouseUp);
-  document.removeEventListener('mousemove', handleMouseMoveHorizontal);
-  document.removeEventListener('mouseup', handleMouseUpHorizontal);
 });
 
 // 拖拽调整大小功能
@@ -242,50 +185,13 @@ const handleMouseMove = (e) => {
 
   const containerRect = container.getBoundingClientRect();
   const newWidth = ((e.clientX - containerRect.left) / containerRect.width) * 100;
-  leftPanelWidth.value = Math.max(20, Math.min(60, newWidth));
+  leftPanelWidth.value = Math.max(20, Math.min(80, newWidth));
 };
 
 const handleMouseUp = () => {
   isDragging.value = false;
   document.removeEventListener('mousemove', handleMouseMove);
   document.removeEventListener('mouseup', handleMouseUp);
-  document.body.style.cursor = '';
-  document.body.style.userSelect = '';
-};
-
-const handleMouseDownHorizontal = () => {
-  console.log('Horizontal resize handle clicked');
-  isDraggingVertical.value = true;
-  document.addEventListener('mousemove', handleMouseMoveHorizontal);
-  document.addEventListener('mouseup', handleMouseUpHorizontal);
-  document.body.style.cursor = 'row-resize';
-  document.body.style.userSelect = 'none';
-
-  // 添加调试日志
-  console.log('Current panel heights:', rightPanelHeight.graph, rightPanelHeight.query);
-};
-
-const handleMouseMoveHorizontal = (e) => {
-  if (!isDraggingVertical.value) return;
-
-  const container = document.querySelector('.right-panel');
-  if (!container) return;
-
-  const containerRect = container.getBoundingClientRect();
-  const newHeight = ((e.clientY - containerRect.top) / containerRect.height) * 100;
-
-  // 修复计算逻辑，确保两个面板的高度总和为100%
-  rightPanelHeight.graph = Math.max(10, Math.min(90, newHeight));
-  rightPanelHeight.query = 100 - rightPanelHeight.graph;
-
-  // 添加调试日志
-  console.log('Vertical resize:', rightPanelHeight.graph, rightPanelHeight.query);
-};
-
-const handleMouseUpHorizontal = () => {
-  isDraggingVertical.value = false;
-  document.removeEventListener('mousemove', handleMouseMoveHorizontal);
-  document.removeEventListener('mouseup', handleMouseUpHorizontal);
   document.body.style.cursor = '';
   document.body.style.userSelect = '';
 };
@@ -326,7 +232,7 @@ const handleMouseUpHorizontal = () => {
 /* Unified Layout Styles */
 .unified-layout {
   display: flex;
-  height: calc(100vh - 54px); /* Adjust based on actual header height */
+  height: 100vh;
   gap: 0;
 
   .left-panel,
@@ -335,13 +241,16 @@ const handleMouseUpHorizontal = () => {
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    padding: 8px;
   }
 
   .left-panel {
+    display: flex;
     flex-shrink: 0;
     flex-grow: 1;
     background-color: var(--gray-0);
-    padding: 8px;
+    padding-right: 0;
+    // max-height: calc(100% - 16px);
   }
 
   .right-panel {
@@ -349,54 +258,52 @@ const handleMouseUpHorizontal = () => {
     overflow: hidden;
     display: flex;
     flex-direction: column;
-  }
-
-  /* 当两个面板都可见时，确保它们正确分配空间 */
-  .right-panel > *:not(.resize-handle-horizontal) {
-    flex: 1;
-    min-height: 0;
+    padding-left: 0;
   }
 
   .resize-handle {
-    width: 1px;
+    width: 4px;
     cursor: col-resize;
     background-color: var(--gray-200);
-    transition: background-color 0.2s ease;
     position: relative;
     z-index: 10;
     flex-shrink: 0;
-
-    &:hover {
-      background-color: var(--main-40);
-    }
-  }
-
-  .resize-handle-horizontal {
-    height: 1px;
-    width: 100%;
-    cursor: row-resize;
-    background-color: var(--gray-200);
-    transition: background-color 0.2s ease;
-    z-index: 10;
-    flex-shrink: 0;
-
-    &:hover {
-      background-color: var(--main-40);
-    }
+    height: 30px;
+    top: 40%;
+    margin: 0 2px;
+    border-radius: 4px;
   }
 }
 
+/* Tab 样式 */
+.knowledge-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--gray-200);
+  border-radius: 12px;
 
-/* Improve the resize handle visibility */
-.resize-handle,
-.resize-handle-horizontal {
-  transition: all 0.2s ease;
-  opacity: 0.6;
-
-  &:hover {
-    opacity: 1;
-    background-color: var(--main-color);
+  :deep(.ant-tabs-content) {
+    flex: 1;
+    height: 100%;
+    overflow: hidden;
   }
+
+  :deep(.ant-tabs-tabpane) {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  :deep(.ant-tabs-nav) {
+    margin-bottom: 0;
+    // background-color: #fff;
+    border-bottom: 1px solid var(--gray-200);
+  }
+}
+
+/* Simplify resize handle */
+.resize-handle {
+  opacity: 0.8;
 }
 
 /* Responsive design for smaller screens */
@@ -428,47 +335,6 @@ const handleMouseUpHorizontal = () => {
 </style>
 
 <style lang="less">
-:deep(.full-modal) {
-  .ant-modal {
-    max-width: 100%;
-    top: 0;
-    padding-bottom: 0;
-    margin: 0;
-    padding: 0;
-  }
-
-  .ant-modal-content {
-    display: flex;
-    flex-direction: column;
-    height: calc(100vh - 200px);
-  }
-
-  .ant-modal-body {
-    flex: 1;
-  }
-}
-
-
-
-.maximized-graph-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-
-  h3 {
-    margin: 0;
-    color: var(--gray-800);
-  }
-}
-
-
-.maximized-graph-content {
-  height: calc(100vh - 300px);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-
 /* 全局样式作为备用方案 */
 .ant-popover .query-params-compact {
   width: 220px;

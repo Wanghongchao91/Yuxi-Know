@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import os
+import tomllib as tomli
 from abc import abstractmethod
 from pathlib import Path
 
@@ -20,6 +22,7 @@ class BaseAgent:
 
     name = "base_agent"
     description = "base_agent"
+    capabilities: list[str] = []  # 智能体能力列表，如 ["file_upload", "web_search"] 等
 
     def __init__(self, **kwargs):
         self.graph = None  # will be covered by get_graph
@@ -27,6 +30,7 @@ class BaseAgent:
         self.context_schema = BaseContext
         self.workdir = Path(sys_config.save_dir) / "agents" / self.module_name
         self.workdir.mkdir(parents=True, exist_ok=True)
+        self._metadata_cache = None  # Cache for metadata to avoid repeated file reads
 
     @property
     def module_name(self) -> str:
@@ -39,12 +43,18 @@ class BaseAgent:
         return self.__class__.__name__
 
     async def get_info(self):
+        # Load metadata from file
+        metadata = self.load_metadata()
+
+        # Merge metadata with class attributes, metadata takes precedence
         return {
             "id": self.id,
-            "name": self.name if hasattr(self, "name") else "Unknown",
-            "description": self.description if hasattr(self, "description") else "Unknown",
+            "name": metadata.get("name", getattr(self, "name", "Unknown")),
+            "description": metadata.get("description", getattr(self, "description", "Unknown")),
+            "examples": metadata.get("examples", []),
             "configurable_items": self.context_schema.get_configurable_items(),
             "has_checkpointer": await self.check_checkpointer(),
+            "capabilities": getattr(self, "capabilities", []),  # 智能体能力列表
         }
 
     async def get_config(self):
@@ -61,11 +71,32 @@ class BaseAgent:
         context = self.context_schema.from_file(module_name=self.module_name, input_context=input_context)
         logger.debug(f"stream_messages: {context}")
         # TODO Checkpointer 似乎还没有适配最新的 1.0 Context API
+
+        # 从 input_context 中提取 attachments（如果有）
+        attachments = (input_context or {}).get("attachments", [])
         input_config = {"configurable": input_context, "recursion_limit": 100}
+
         async for msg, metadata in graph.astream(
-            {"messages": messages}, stream_mode="messages", context=context, config=input_config
+            {"messages": messages, "attachments": attachments},
+            stream_mode="messages",
+            context=context,
+            config=input_config,
         ):
             yield msg, metadata
+
+    async def invoke_messages(self, messages: list[str], input_context=None, **kwargs):
+        graph = await self.get_graph()
+        context = self.context_schema.from_file(module_name=self.module_name, input_context=input_context)
+        logger.debug(f"invoke_messages: {context}")
+
+        # 从 input_context 中提取 attachments（如果有）
+        attachments = (input_context or {}).get("attachments", [])
+        input_config = {"configurable": input_context, "recursion_limit": 100}
+
+        msg = await graph.ainvoke(
+            {"messages": messages, "attachments": attachments}, context=context, config=input_config
+        )
+        return msg
 
     async def check_checkpointer(self):
         app = await self.get_graph()
@@ -130,3 +161,42 @@ class BaseAgent:
     async def get_aio_memory(self) -> AsyncSqliteSaver:
         """获取异步存储实例"""
         return AsyncSqliteSaver(await self.get_async_conn())
+
+    def load_metadata(self) -> dict:
+        """Load metadata from metadata.toml file in the agent's source directory."""
+        if self._metadata_cache is not None:
+            return self._metadata_cache
+
+        # Try to find metadata.toml in the agent's source directory
+        try:
+            # Get the agent's source file directory
+            agent_module = self.__class__.__module__
+
+            # Use importlib to get the module's file path
+            spec = importlib.util.find_spec(agent_module)
+            if spec and spec.origin:
+                agent_file = Path(spec.origin)
+                agent_dir = agent_file.parent
+            else:
+                # Fallback: construct path from module name
+                module_path = agent_module.replace(".", "/")
+                agent_file = Path(f"src/{module_path}.py")
+                agent_dir = agent_file.parent
+
+            metadata_file = agent_dir / "metadata.toml"
+
+            if metadata_file.exists():
+                with open(metadata_file, "rb") as f:
+                    metadata = tomli.load(f)
+                    self._metadata_cache = metadata
+                    logger.debug(f"Loaded metadata from {metadata_file}")
+                    return metadata
+            else:
+                logger.debug(f"No metadata.toml found for {self.module_name} at {metadata_file}")
+                self._metadata_cache = {}
+                return {}
+
+        except Exception as e:
+            logger.error(f"Error loading metadata for {self.module_name}: {e}")
+            self._metadata_cache = {}
+            return {}

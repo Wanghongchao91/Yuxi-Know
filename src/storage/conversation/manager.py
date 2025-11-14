@@ -45,13 +45,16 @@ class ConversationManager:
         if not thread_id:
             thread_id = str(uuid.uuid4())
 
+        metadata = (metadata or {}).copy()
+        metadata.setdefault("attachments", [])
+
         conversation = Conversation(
             thread_id=thread_id,
             user_id=str(user_id),
             agent_id=agent_id,
             title=title or "New Conversation",
             status="active",
-            extra_metadata=metadata if metadata else None,
+            extra_metadata=metadata,
         )
 
         self.db.add(conversation)
@@ -79,6 +82,26 @@ class ConversationManager:
         """
         return self.db.query(Conversation).filter(Conversation.thread_id == thread_id).first()
 
+    def _get_conversation_by_id(self, conversation_id: int) -> Conversation | None:
+        return self.db.query(Conversation).filter(Conversation.id == conversation_id).first()
+
+    def _ensure_metadata(self, conversation: Conversation) -> dict:
+        """
+        Return a shallow copy of conversation metadata with a standalone attachments list.
+
+        We copy here because SQLAlchemy's JSON type does not automatically detect in-place
+        mutations. By assigning a fresh dict/list back we ensure the ORM marks the row dirty.
+        """
+        metadata = dict(conversation.extra_metadata or {})
+        metadata["attachments"] = list(metadata.get("attachments", []))
+        return metadata
+
+    def _save_metadata(self, conversation: Conversation, metadata: dict) -> None:
+        conversation.extra_metadata = metadata
+        conversation.updated_at = utc_now()
+        self.db.commit()
+        self.db.refresh(conversation)
+
     def add_message(
         self,
         conversation_id: int,
@@ -86,6 +109,7 @@ class ConversationManager:
         content: str,
         message_type: str = "text",
         extra_metadata: dict | None = None,
+        image_content: str | None = None,
     ) -> Message:
         """
         Add a message to a conversation
@@ -94,8 +118,9 @@ class ConversationManager:
             conversation_id: Conversation ID
             role: Message role (user/assistant/system/tool)
             content: Message content
-            message_type: Message type (text/tool_call/tool_result)
+            message_type: Message type (text/tool_call/tool_result/multimodal_image)
             extra_metadata: Additional metadata (complete message dump)
+            image_content: Base64 encoded image content for multimodal messages
 
         Returns:
             Created Message object
@@ -106,11 +131,12 @@ class ConversationManager:
             content=content,
             message_type=message_type,
             extra_metadata=extra_metadata or {},
+            image_content=image_content,
         )
 
         self.db.add(message)
         # Mark the parent conversation as active for sorting/analytics
-        conversation = self.db.query(Conversation).filter(Conversation.id == conversation_id).first()
+        conversation = self._get_conversation_by_id(conversation_id)
         if conversation:
             conversation.updated_at = utc_now()
 
@@ -130,6 +156,7 @@ class ConversationManager:
         content: str,
         message_type: str = "text",
         extra_metadata: dict | None = None,
+        image_content: str | None = None,
     ) -> Message | None:
         """
         Add a message to a conversation by thread ID
@@ -138,8 +165,9 @@ class ConversationManager:
             thread_id: Thread ID
             role: Message role (user/assistant/system/tool)
             content: Message content
-            message_type: Message type (text/tool_call/tool_result)
+            message_type: Message type (text/tool_call/tool_result/multimodal_image)
             extra_metadata: Additional metadata (complete message dump)
+            image_content: Base64 encoded image content for multimodal messages
 
         Returns:
             Created Message object or None if conversation not found
@@ -155,6 +183,7 @@ class ConversationManager:
             content=content,
             message_type=message_type,
             extra_metadata=extra_metadata,
+            image_content=image_content,
         )
 
     def add_tool_call(
@@ -441,3 +470,72 @@ class ConversationManager:
             message_count = self.db.query(Message).filter(Message.conversation_id == conversation_id).count()
             stats.message_count = message_count
             self.db.commit()
+
+    # -------------------------------------------------------------------------
+    # Attachment helpers
+    # -------------------------------------------------------------------------
+
+    def get_attachments(self, conversation_id: int) -> list[dict]:
+        conversation = self._get_conversation_by_id(conversation_id)
+        if not conversation:
+            return []
+        metadata = self._ensure_metadata(conversation)
+        return list(metadata.get("attachments", []))
+
+    def get_attachments_by_thread_id(self, thread_id: str) -> list[dict]:
+        conversation = self.get_conversation_by_thread_id(thread_id)
+        if not conversation:
+            return []
+        return self.get_attachments(conversation.id)
+
+    def add_attachment(self, conversation_id: int, attachment_info: dict) -> dict | None:
+        conversation = self._get_conversation_by_id(conversation_id)
+        if not conversation:
+            return None
+
+        metadata = self._ensure_metadata(conversation)
+        attachments = metadata.get("attachments", [])
+        attachments = [item for item in attachments if item.get("file_id") != attachment_info.get("file_id")]
+        attachments.append(attachment_info)
+        metadata["attachments"] = attachments
+        self._save_metadata(conversation, metadata)
+        return attachment_info
+
+    def update_attachment_status(
+        self, conversation_id: int, file_id: str, status: str, update_fields: dict | None = None
+    ) -> dict | None:
+        conversation = self._get_conversation_by_id(conversation_id)
+        if not conversation:
+            return None
+
+        metadata = self._ensure_metadata(conversation)
+        attachments = metadata.get("attachments", [])
+        target = None
+        for item in attachments:
+            if item.get("file_id") == file_id:
+                item["status"] = status
+                if update_fields:
+                    item.update(update_fields)
+                target = item
+                break
+
+        if target is not None:
+            metadata["attachments"] = attachments
+            self._save_metadata(conversation, metadata)
+        return target
+
+    def remove_attachment(self, conversation_id: int, file_id: str) -> bool:
+        conversation = self._get_conversation_by_id(conversation_id)
+        if not conversation:
+            return False
+
+        metadata = self._ensure_metadata(conversation)
+        attachments = metadata.get("attachments", [])
+        new_attachments = [item for item in attachments if item.get("file_id") != file_id]
+
+        if len(new_attachments) == len(attachments):
+            return False
+
+        metadata["attachments"] = new_attachments
+        self._save_metadata(conversation, metadata)
+        return True

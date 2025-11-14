@@ -3,11 +3,12 @@
     <ChatSidebarComponent
       :current-chat-id="currentChatId"
       :chats-list="chatsList"
-      :is-sidebar-open="uiState.isSidebarOpen"
-      :is-initial-render="uiState.isInitialRender"
+      :is-sidebar-open="chatUIStore.isSidebarOpen"
+      :is-initial-render="localUIState.isInitialRender"
       :single-mode="props.singleMode"
       :agents="agents"
       :selected-agent-id="currentAgentId"
+      :is-creating-new-chat="chatUIStore.creatingNewChat"
       @create-chat="createNewChat"
       @select-chat="selectChat"
       @delete-chat="deleteChat"
@@ -16,21 +17,28 @@
       @open-agent-modal="openAgentModal"
       :class="{
         'floating-sidebar': isSmallContainer,
-        'sidebar-open': uiState.isSidebarOpen,
-        'no-transition': uiState.isInitialRender,
-        'collapsed': isSmallContainer && !uiState.isSidebarOpen
+        'sidebar-open': chatUIStore.isSidebarOpen,
+        'no-transition': localUIState.isInitialRender,
+        'collapsed': isSmallContainer && !chatUIStore.isSidebarOpen
       }"
     />
-    <div class="sidebar-backdrop" v-if="uiState.isSidebarOpen && isSmallContainer" @click="toggleSidebar"></div>
+    <div class="sidebar-backdrop" v-if="chatUIStore.isSidebarOpen && isSmallContainer" @click="toggleSidebar"></div>
     <div class="chat">
       <div class="chat-header">
         <div class="header__left">
           <slot name="header-left" class="nav-btn"></slot>
-          <div type="button" class="agent-nav-btn" v-if="!uiState.isSidebarOpen" @click="toggleSidebar">
+          <div type="button" class="agent-nav-btn" v-if="!chatUIStore.isSidebarOpen" @click="toggleSidebar">
             <PanelLeftOpen  class="nav-btn-icon" size="18"/>
           </div>
-          <div type="button" class="agent-nav-btn" v-if="!uiState.isSidebarOpen" @click="createNewChat" :disabled="isProcessing">
-            <MessageCirclePlus  class="nav-btn-icon"  size="18"/>
+          <div
+            type="button"
+            class="agent-nav-btn"
+            v-if="!chatUIStore.isSidebarOpen"
+            :class="{ 'is-disabled': chatUIStore.creatingNewChat }"
+            @click="createNewChat"
+          >
+            <LoaderCircle v-if="chatUIStore.creatingNewChat" class="nav-btn-icon loading-icon" size="18"/>
+            <MessageCirclePlus v-else class="nav-btn-icon"  size="18"/>
             <span class="text" :class="{'hide-text': isMediumContainer}">新对话</span>
           </div>
         </div>
@@ -45,20 +53,21 @@
         </div>
       </div>
 
-      <div v-if="isLoadingThreads || isLoadingMessages" class="chat-loading">
-        <LoadingOutlined />
-        <span>正在加载历史记录...</span>
+      <!-- 加载状态：加载消息 -->
+      <div v-if="isLoadingMessages" class="chat-loading">
+        <div class="loading-spinner"></div>
+        <span>正在加载消息...</span>
       </div>
 
       <div v-else-if="!conversations.length" class="chat-examples">
-        <img v-if="currentAgentMetadata?.icon" class="agent-icons" :src="currentAgentMetadata?.icon" alt="智能体图标" />
-        <div v-else style="margin-bottom: 150px"></div>
-        <h1>您好，我是{{ currentAgentName }}！有什么可以帮您？</h1>
+        <div style="margin-bottom: 150px"></div>
+        <h1>您好，我是{{ currentAgentName }}！</h1>
         <!-- <h1>{{ currentAgent ? currentAgent.name : '请选择一个智能体开始对话' }}</h1>
         <p>{{ currentAgent ? currentAgent.description : '不同的智能体有不同的专长和能力' }}</p> -->
 
         <div class="inputer-init">
           <MessageInputComponent
+            ref="messageInputRef"
             v-model="userInput"
             :is-loading="isProcessing"
             :disabled="!currentAgent"
@@ -66,7 +75,32 @@
             placeholder="输入问题..."
             @send="handleSendOrStop"
             @keydown="handleKeyDown"
-          />
+          >
+            <template #top>
+              <ImagePreviewComponent
+                v-if="currentImage"
+                :image-data="currentImage"
+                @remove="handleImageRemoved"
+                class="image-preview-wrapper"
+              />
+            </template>
+            <template #options-left>
+              <AttachmentOptionsComponent
+                v-if="supportsFileUpload"
+                :disabled="!currentAgent"
+                @upload="handleAttachmentUpload"
+                @upload-image="handleImageUpload"
+                @upload-image-success="handleImageUploadSuccess"
+              />
+            </template>
+            <template #actions-left>
+              <AttachmentStatusIndicator
+                :attachments="currentAttachments"
+                :disabled="!currentAgent"
+                @remove="handleAttachmentRemove"
+              />
+            </template>
+          </MessageInputComponent>
 
           <!-- 示例问题 -->
           <div class="example-questions" v-if="exampleQuestions.length > 0">
@@ -97,14 +131,14 @@
           </AgentMessageComponent>
           <!-- 显示对话最后一个消息使用的模型 -->
           <RefsComponent
-            v-if="getLastMessage(conv) && conv.status !== 'streaming'"
+            v-if="shouldShowRefs(conv)"
             :message="getLastMessage(conv)"
             :show-refs="['model', 'copy']"
             :is-latest-message="false"
           />
         </div>
 
-        <!-- 生成中的加载状态 -->
+        <!-- 生成中的加载状态 - 增强条件支持主聊天和resume流程 -->
         <div class="generating-status" v-if="isProcessing && conversations.length > 0">
           <div class="generating-indicator">
             <div class="loading-dots">
@@ -117,8 +151,18 @@
         </div>
       </div>
       <div class="bottom">
+        <!-- 人工审批弹窗 - 放在输入框上方 -->
+        <HumanApprovalModal
+          :visible="approvalState.showModal"
+          :question="approvalState.question"
+          :operation="approvalState.operation"
+          @approve="handleApprove"
+          @reject="handleReject"
+        />
+
         <div class="message-input-wrapper" v-if="conversations.length > 0">
           <MessageInputComponent
+            ref="messageInputRef"
             v-model="userInput"
             :is-loading="isProcessing"
             :disabled="!currentAgent"
@@ -126,7 +170,32 @@
             placeholder="输入问题..."
             @send="handleSendOrStop"
             @keydown="handleKeyDown"
-          />
+          >
+            <template #top>
+              <ImagePreviewComponent
+                v-if="currentImage"
+                :image-data="currentImage"
+                @remove="handleImageRemoved"
+                class="image-preview-wrapper"
+              />
+            </template>
+            <template #options-left>
+              <AttachmentOptionsComponent
+                v-if="supportsFileUpload"
+                :disabled="!currentAgent"
+                @upload="handleAttachmentUpload"
+                @upload-image="handleImageUpload"
+                @upload-image-success="handleImageUploadSuccess"
+              />
+            </template>
+            <template #actions-left>
+              <AttachmentStatusIndicator
+                :attachments="currentAttachments"
+                :disabled="!currentAgent"
+                @remove="handleAttachmentRemove"
+              />
+            </template>
+          </MessageInputComponent>
           <div class="bottom-actions">
             <p class="note">请注意辨别内容的可靠性</p>
           </div>
@@ -141,21 +210,27 @@ import { ref, reactive, onMounted, watch, nextTick, computed, onUnmounted } from
 import { LoadingOutlined } from '@ant-design/icons-vue';
 import { message } from 'ant-design-vue';
 import MessageInputComponent from '@/components/MessageInputComponent.vue'
+import AttachmentInputPanel from '@/components/AttachmentInputPanel.vue'
+import AttachmentOptionsComponent from '@/components/AttachmentOptionsComponent.vue'
+import AttachmentStatusIndicator from '@/components/AttachmentStatusIndicator.vue'
 import AgentMessageComponent from '@/components/AgentMessageComponent.vue'
+import ImagePreviewComponent from '@/components/ImagePreviewComponent.vue'
 import ChatSidebarComponent from '@/components/ChatSidebarComponent.vue'
 import RefsComponent from '@/components/RefsComponent.vue'
-import { PanelLeftOpen, MessageCirclePlus } from 'lucide-vue-next';
+import { PanelLeftOpen, MessageCirclePlus, LoaderCircle } from 'lucide-vue-next';
 import { handleChatError, handleValidationError } from '@/utils/errorHandler';
 import { ScrollController } from '@/utils/scrollController';
 import { AgentValidator } from '@/utils/agentValidator';
 import { useAgentStore } from '@/stores/agent';
+import { useChatUIStore } from '@/stores/chatUI';
 import { storeToRefs } from 'pinia';
 import { MessageProcessor } from '@/utils/messageProcessor';
 import { agentApi, threadApi } from '@/apis';
+import HumanApprovalModal from '@/components/HumanApprovalModal.vue';
+import { useApproval } from '@/composables/useApproval';
 
 // ==================== PROPS & EMITS ====================
 const props = defineProps({
-  state: { type: Object, default: () => ({}) },
   agentId: { type: String, default: '' },
   singleMode: { type: Boolean, default: true }
 });
@@ -163,6 +238,7 @@ const emit = defineEmits(['open-config', 'open-agent-modal']);
 
 // ==================== STORE MANAGEMENT ====================
 const agentStore = useAgentStore();
+const chatUIStore = useChatUIStore();
 const {
   agents,
   selectedAgentId,
@@ -174,18 +250,29 @@ const userInput = ref('');
 
 // 从智能体元数据获取示例问题
 const exampleQuestions = computed(() => {
-  const examples = currentAgentMetadata.value?.examples || [];
+  const agentId = currentAgentId.value;
+  let examples = [];
+  if (agentId && agents.value && agents.value.length > 0) {
+    const agent = agents.value.find(a => a.id === agentId);
+    examples = agent ? (agent.examples || []) : [];
+  }
   return examples.map((text, index) => ({
     id: index + 1,
     text: text
   }));
 });
 
+// Keep per-thread streaming scratch data in a consistent shape.
+const createOnGoingConvState = () => ({
+  msgChunks: {},
+  currentRequestKey: null,
+  currentAssistantKey: null,
+  toolCallBuffers: {}
+});
+
+// 业务状态（保留在组件本地）
 const chatState = reactive({
   currentThreadId: null,
-  isLoadingThreads: false,
-  isLoadingMessages: false,
-  creatingNewChat: false,
   // 以threadId为键的线程状态
   threadStates: {}
 });
@@ -194,12 +281,17 @@ const chatState = reactive({
 const threads = ref([]);
 const threadMessages = ref({});
 
-const uiState = reactive({
-  ...props.state,
-  isSidebarOpen: localStorage.getItem('chat_sidebar_open') !== 'false',
+// 本地 UI 状态（仅在本组件使用）
+const localUIState = reactive({
   isInitialRender: true,
   containerWidth: 0,
 });
+
+const attachmentState = reactive({
+  itemsByThread: {},
+  limits: null,
+  isUploading: false,
+})
 
 // ==================== COMPUTED PROPERTIES ====================
 const currentAgentId = computed(() => {
@@ -210,14 +302,19 @@ const currentAgentId = computed(() => {
   }
 });
 
-const currentAgentMetadata = computed(() => {
+const currentAgentName = computed(() => {
   const agentId = currentAgentId.value;
-  const metadata = agentStore?.metadata || {};
-  return agentId && metadata[agentId] ? metadata[agentId] : {};
+  if (agentId && agents.value && agents.value.length > 0) {
+    const agent = agents.value.find(a => a.id === agentId);
+    return agent ? agent.name : '智能体';
+  }
+  return '智能体';
 });
-const currentAgentName = computed(() => currentAgentMetadata.value?.name || currentAgent.value?.name || '智能体');
 
-const currentAgent = computed(() => agents.value[currentAgentId.value] || null);
+const currentAgent = computed(() => {
+  if (!currentAgentId.value || !agents.value || !agents.value.length) return null;
+  return agents.value.find(a => a.id === currentAgentId.value) || null;
+});
 const chatsList = computed(() => threads.value || []);
 const currentChatId = computed(() => chatState.currentThreadId);
 const currentThread = computed(() => {
@@ -225,7 +322,31 @@ const currentThread = computed(() => {
   return threads.value.find(thread => thread.id === currentChatId.value) || null;
 });
 
+const currentAttachments = computed(() => {
+  if (!currentChatId.value) return [];
+  return attachmentState.itemsByThread[currentChatId.value] || [];
+});
+
+// 检查当前智能体是否支持文件上传
+const supportsFileUpload = computed(() => {
+  if (!currentAgent.value) return false;
+  const capabilities = currentAgent.value.capabilities || [];
+  return capabilities.includes('file_upload');
+});
+
 const currentThreadMessages = computed(() => threadMessages.value[currentChatId.value] || []);
+
+// 计算是否显示Refs组件的条件
+const shouldShowRefs = computed(() => {
+  return (conv) => {
+    return getLastMessage(conv) &&
+           conv.status !== 'streaming' &&
+           !approvalState.showModal &&
+           !(approvalState.threadId &&
+             chatState.currentThreadId === approvalState.threadId &&
+             isProcessing.value);
+  };
+});
 
 // 当前线程状态的computed属性
 const currentThreadState = computed(() => {
@@ -267,28 +388,30 @@ const conversations = computed(() => {
   return historyConvs;
 });
 
-const isLoadingThreads = computed(() => chatState.isLoadingThreads);
-const isLoadingMessages = computed(() => chatState.isLoadingMessages);
+const isLoadingThreads = computed(() => chatUIStore.isLoadingThreads);
+const isLoadingMessages = computed(() => chatUIStore.isLoadingMessages);
 const isStreaming = computed(() => {
   const threadState = currentThreadState.value;
   return threadState ? threadState.isStreaming : false;
 });
-const isProcessing = computed(() => isStreaming.value || chatState.creatingNewChat);
-const isSmallContainer = computed(() => uiState.containerWidth <= 520);
-const isMediumContainer = computed(() => uiState.containerWidth <= 768);
+const isProcessing = computed(() => isStreaming.value);
+const isSmallContainer = computed(() => localUIState.containerWidth <= 520);
+const isMediumContainer = computed(() => localUIState.containerWidth <= 768);
 
 // ==================== SCROLL & RESIZE HANDLING ====================
 const chatContainerRef = ref(null);
+const messageInputRef = ref(null);
+const currentImage = ref(null);
 const scrollController = new ScrollController('.chat');
 let resizeObserver = null;
 
 onMounted(() => {
   nextTick(() => {
     if (chatContainerRef.value) {
-      uiState.containerWidth = chatContainerRef.value.offsetWidth;
+      localUIState.containerWidth = chatContainerRef.value.offsetWidth;
       resizeObserver = new ResizeObserver(entries => {
         for (let entry of entries) {
-          uiState.containerWidth = entry.contentRect.width;
+          localUIState.containerWidth = entry.contentRect.width;
         }
       });
       resizeObserver.observe(chatContainerRef.value);
@@ -298,7 +421,7 @@ onMounted(() => {
       chatContainer.addEventListener('scroll', scrollController.handleScroll, { passive: true });
     }
   });
-  setTimeout(() => { uiState.isInitialRender = false; }, 300);
+  setTimeout(() => { localUIState.isInitialRender = false; }, 300);
 });
 
 onUnmounted(() => {
@@ -316,7 +439,7 @@ const getThreadState = (threadId) => {
     chatState.threadStates[threadId] = {
       isStreaming: false,
       streamAbortController: null,
-      onGoingConv: { msgChunks: {} }
+      onGoingConv: createOnGoingConvState()
     };
   }
   return chatState.threadStates[threadId];
@@ -336,6 +459,7 @@ const cleanupThreadState = (threadId) => {
 
 // ==================== STREAM HANDLING LOGIC ====================
 const resetOnGoingConv = (threadId = null, preserveMessages = false) => {
+  console.log('🔄 [RESET] Resetting on going conversation:', threadId, preserveMessages);
   if (threadId) {
     // 清理指定线程的状态
     const threadState = getThreadState(threadId);
@@ -349,11 +473,11 @@ const resetOnGoingConv = (threadId = null, preserveMessages = false) => {
         // 延迟清空消息，给历史记录加载足够时间
         setTimeout(() => {
           if (threadState.onGoingConv) {
-            threadState.onGoingConv = { msgChunks: {} };
-          }
+      threadState.onGoingConv = createOnGoingConvState();
+    }
         }, 100);
       } else {
-        threadState.onGoingConv = { msgChunks: {} };
+        threadState.onGoingConv = createOnGoingConvState();
       }
     }
   } else {
@@ -369,11 +493,11 @@ const resetOnGoingConv = (threadId = null, preserveMessages = false) => {
         if (preserveMessages) {
           setTimeout(() => {
             if (threadState.onGoingConv) {
-              threadState.onGoingConv = { msgChunks: {} };
-            }
+        threadState.onGoingConv = createOnGoingConvState();
+      }
           }, 100);
         } else {
-          threadState.onGoingConv = { msgChunks: {} };
+          threadState.onGoingConv = createOnGoingConvState();
         }
       }
     } else {
@@ -386,9 +510,9 @@ const resetOnGoingConv = (threadId = null, preserveMessages = false) => {
 };
 
 const _processStreamChunk = (chunk, threadId) => {
-  const { status, msg, request_id, message } = chunk;
+  const { status, msg, request_id, message: chunkMessage } = chunk;
   const threadState = getThreadState(threadId);
-  // console.log('msg:', msg);
+  // console.log('Processing stream chunk:', chunk, 'for thread:', threadId);
 
   if (!threadState) return false;
 
@@ -400,12 +524,12 @@ const _processStreamChunk = (chunk, threadId) => {
       if (msg.id) {
         if (!threadState.onGoingConv.msgChunks[msg.id]) {
           threadState.onGoingConv.msgChunks[msg.id] = [];
-        }
+                }
         threadState.onGoingConv.msgChunks[msg.id].push(msg);
       }
-      return false;
+        return false;
     case 'error':
-      handleChatError({ message }, 'stream');
+      handleChatError({ message: chunkMessage }, 'stream');
       // Stop the loading indicator
       if (threadState) {
         threadState.isStreaming = false;
@@ -421,6 +545,9 @@ const _processStreamChunk = (chunk, threadId) => {
       fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId });
       resetOnGoingConv(threadId);
       return true;
+    case 'human_approval_required':
+      // 使用审批 composable 处理审批请求
+      return processApprovalInStream(chunk, threadId, currentAgentId.value);
     case 'finished':
       // 先标记流式结束，但保持消息显示直到历史记录加载完成
       if (threadState) {
@@ -438,10 +565,14 @@ const _processStreamChunk = (chunk, threadId) => {
       if (threadState) {
         threadState.isStreaming = false;
       }
+      // 如果有 message 字段，显示提示（例如：敏感内容检测）
+      if (chunkMessage) {
+        message.info(chunkMessage);
+      }
       fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId })
         .finally(() => {
-          resetOnGoingConv(threadId, true);
-        });
+        resetOnGoingConv(threadId, true);
+      });
       return true;
   }
 
@@ -454,16 +585,22 @@ const fetchThreads = async (agentId = null) => {
   const targetAgentId = agentId || currentAgentId.value;
   if (!targetAgentId) return;
 
-  chatState.isLoadingThreads = true;
+  chatUIStore.isLoadingThreads = true;
   try {
     const fetchedThreads = await threadApi.getThreads(targetAgentId);
     threads.value = fetchedThreads || [];
+    const validIds = new Set((threads.value || []).map(thread => thread.id));
+    Object.keys(attachmentState.itemsByThread).forEach((id) => {
+      if (!validIds.has(id)) {
+        delete attachmentState.itemsByThread[id];
+      }
+    });
   } catch (error) {
     console.error('Failed to fetch threads:', error);
     handleChatError(error, 'fetch');
     throw error;
   } finally {
-    chatState.isLoadingThreads = false;
+    chatUIStore.isLoadingThreads = false;
   }
 };
 
@@ -477,6 +614,7 @@ const createThread = async (agentId, title = '新的对话') => {
     if (thread) {
       threads.value.unshift(thread);
       threadMessages.value[thread.id] = [];
+      attachmentState.itemsByThread[thread.id] = [];
     }
     return thread;
   } catch (error) {
@@ -497,6 +635,7 @@ const deleteThread = async (threadId) => {
     await threadApi.deleteThread(threadId);
     threads.value = threads.value.filter(thread => thread.id !== threadId);
     delete threadMessages.value[threadId];
+    delete attachmentState.itemsByThread[threadId];
 
     if (chatState.currentThreadId === threadId) {
       chatState.currentThreadId = null;
@@ -531,11 +670,17 @@ const updateThread = async (threadId, title) => {
 };
 
 // 获取线程消息
-const fetchThreadMessages = async ({ agentId, threadId }) => {
+const fetchThreadMessages = async ({ agentId, threadId, delay = 0 }) => {
   if (!threadId || !agentId) return;
+
+  // 如果指定了延迟，等待指定时间（用于确保后端数据库事务提交）
+  if (delay > 0) {
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
 
   try {
     const response = await agentApi.getAgentHistory(agentId, threadId);
+    console.log('🔄 [FETCH] Thread messages:', response);
     threadMessages.value[threadId] = response.history || [];
   } catch (error) {
     handleChatError(error, 'load');
@@ -543,8 +688,101 @@ const fetchThreadMessages = async ({ agentId, threadId }) => {
   }
 };
 
+const loadThreadAttachments = async (threadId, { silent = false } = {}) => {
+  if (!threadId) return;
+  try {
+    const response = await threadApi.getThreadAttachments(threadId);
+    attachmentState.itemsByThread[threadId] = response.attachments || [];
+    if (response.limits) {
+      attachmentState.limits = response.limits;
+    }
+  } catch (error) {
+    if (silent) {
+      console.warn('Failed to load attachments:', error);
+    } else {
+      handleChatError(error, 'load');
+    }
+  }
+};
+
+const ensureActiveThread = async (title = '新的对话') => {
+  if (currentChatId.value) return currentChatId.value;
+  try {
+    const newThread = await createThread(currentAgentId.value, title || '新的对话');
+    if (newThread) {
+      chatState.currentThreadId = newThread.id;
+      return newThread.id;
+    }
+  } catch (error) {
+    // createThread 已处理错误提示
+  }
+  return null;
+};
+
+const handleAttachmentUpload = async (files) => {
+  if (!files?.length) return;
+  if (!AgentValidator.validateAgentIdWithError(currentAgentId.value, '上传附件', handleValidationError)) return;
+
+  const preferredTitle = files[0]?.name || '新的对话';
+  const threadId = await ensureActiveThread(preferredTitle);
+  if (!threadId) {
+    message.error('创建对话失败，无法上传附件');
+    return;
+  }
+
+  attachmentState.isUploading = true;
+  try {
+    for (const file of files) {
+      await threadApi.uploadThreadAttachment(threadId, file);
+      message.success(`${file.name} 上传成功`);
+    }
+    await loadThreadAttachments(threadId, { silent: true });
+  } catch (error) {
+    handleChatError(error, 'upload');
+  } finally {
+    attachmentState.isUploading = false;
+  }
+};
+
+const handleAttachmentRemove = async (fileId) => {
+  if (!fileId || !currentChatId.value) return;
+  try {
+    await threadApi.deleteThreadAttachment(currentChatId.value, fileId);
+    await loadThreadAttachments(currentChatId.value, { silent: true });
+    message.success('附件已删除');
+  } catch (error) {
+    handleChatError(error, 'delete');
+  }
+};
+
+// 处理图片上传
+const handleImageUpload = (imageData) => {
+  if (imageData && imageData.success) {
+    currentImage.value = imageData;
+  }
+};
+
+// 处理图片移除
+const handleImageRemoved = () => {
+  currentImage.value = null;
+};
+
+// 处理图片上传成功，关闭选项面板
+const handleImageUploadSuccess = () => {
+  if (messageInputRef.value) {
+    messageInputRef.value.closeOptions();
+  }
+};
+
+// ==================== 审批功能管理 ====================
+const { approvalState, handleApproval, processApprovalInStream } = useApproval({
+  getThreadState,
+  resetOnGoingConv,
+  fetchThreadMessages
+});
+
 // 发送消息并处理流式响应
-const sendMessage = async ({ agentId, threadId, text, signal = undefined }) => {
+const sendMessage = async ({ agentId, threadId, text, signal = undefined, imageData = undefined }) => {
   if (!agentId || !threadId || !text) {
     const error = new Error("Missing agent, thread, or message text");
     handleChatError(error, 'send');
@@ -562,6 +800,11 @@ const sendMessage = async ({ agentId, threadId, text, signal = undefined }) => {
       thread_id: threadId,
     },
   };
+
+  // 如果有图片，添加到请求中
+  if (imageData && imageData.imageContent) {
+    requestData.image_content = imageData.imageContent;
+  }
 
   try {
     return await agentApi.sendAgentMessage(agentId, requestData, signal ? { signal } : undefined);
@@ -591,7 +834,7 @@ const switchToFirstChatIfEmpty = async () => {
 };
 
 const createNewChat = async () => {
-  if (!AgentValidator.validateAgentId(currentAgentId.value, '创建对话') || isProcessing.value) return;
+  if (!AgentValidator.validateAgentId(currentAgentId.value, '创建对话') || chatUIStore.creatingNewChat) return;
 
   // 如果第一个对话为空，直接切换到第一个对话而不是创建新对话
   if (await switchToFirstChatIfEmpty()) return;
@@ -600,32 +843,53 @@ const createNewChat = async () => {
   const currentThreadIndex = threads.value.findIndex(thread => thread.id === currentChatId.value);
   if (currentChatId.value && conversations.value.length === 0 && currentThreadIndex === 0) return;
 
-  chatState.creatingNewChat = true;
+  chatUIStore.creatingNewChat = true;
   try {
     const newThread = await createThread(currentAgentId.value, '新的对话');
     if (newThread) {
+      // 中断之前线程的流式输出（如果存在）
+      const previousThreadId = chatState.currentThreadId;
+      if (previousThreadId) {
+        const previousThreadState = getThreadState(previousThreadId);
+        if (previousThreadState?.isStreaming && previousThreadState.streamAbortController) {
+          previousThreadState.streamAbortController.abort();
+          previousThreadState.isStreaming = false;
+          previousThreadState.streamAbortController = null;
+        }
+      }
+
       chatState.currentThreadId = newThread.id;
     }
   } catch (error) {
     handleChatError(error, 'create');
   } finally {
-    chatState.creatingNewChat = false;
+    chatUIStore.creatingNewChat = false;
   }
 };
 
 const selectChat = async (chatId) => {
   if (!AgentValidator.validateAgentIdWithError(currentAgentId.value, '选择对话', handleValidationError)) return;
 
-  // 切换线程时，不再中断上一个线程的流式输出
-  // resetOnGoingConv(chatState.currentThreadId);
+  // 中断之前线程的流式输出（如果存在）
+  const previousThreadId = chatState.currentThreadId;
+  if (previousThreadId && previousThreadId !== chatId) {
+    const previousThreadState = getThreadState(previousThreadId);
+    if (previousThreadState?.isStreaming && previousThreadState.streamAbortController) {
+      previousThreadState.streamAbortController.abort();
+      previousThreadState.isStreaming = false;
+      previousThreadState.streamAbortController = null;
+    }
+  }
+
   chatState.currentThreadId = chatId;
-  chatState.isLoadingMessages = true;
+  chatUIStore.isLoadingMessages = true;
   try {
     await fetchThreadMessages({ agentId: currentAgentId.value, threadId: chatId });
+    await loadThreadAttachments(chatId, { silent: true });
   } catch (error) {
     handleChatError(error, 'load');
   } finally {
-    chatState.isLoadingMessages = false;
+    chatUIStore.isLoadingMessages = false;
   }
 
   await nextTick();
@@ -638,9 +902,11 @@ const deleteChat = async (chatId) => {
     await deleteThread(chatId);
     if (chatState.currentThreadId === chatId) {
       chatState.currentThreadId = null;
-      if (chatsList.value.length > 0) {
-        await selectChat(chatsList.value[0].id);
-      }
+      // 如果删除的是当前对话，自动创建新对话
+      await createNewChat();
+    } else if (chatsList.value.length > 0) {
+      // 如果删除的不是当前对话，选择第一个可用对话
+      await selectChat(chatsList.value[0].id);
     }
   } catch (error) {
     handleChatError(error, 'delete');
@@ -662,27 +928,24 @@ const handleSendMessage = async () => {
   const text = userInput.value.trim();
   if (!text || !currentAgent.value || isProcessing.value) return;
 
-  // 如果没有当前线程，先创建一个新线程
-  if (!currentChatId.value) {
-    try {
-      const newThread = await createThread(currentAgentId.value, text);
-      if (newThread) {
-        chatState.currentThreadId = newThread.id;
-      } else {
-        message.error('创建对话失败，请重试');
-        return;
-      }
-    } catch (error) {
-      handleChatError(error, 'create');
+  let threadId = currentChatId.value;
+  if (!threadId) {
+    threadId = await ensureActiveThread(text);
+    if (!threadId) {
+      message.error('创建对话失败，请重试');
       return;
     }
   }
 
   userInput.value = '';
+
+  // 保存当前图片数据，在发送后再清除
+  const imageData = currentImage.value;
+  currentImage.value = null;
+
   await nextTick();
   scrollController.scrollToBottom(true);
 
-  const threadId = currentChatId.value;
   const threadState = getThreadState(threadId);
   if (!threadState) return;
 
@@ -695,7 +958,8 @@ const handleSendMessage = async () => {
       agentId: currentAgentId.value,
       threadId: currentChatId.value,
       text: text,
-      signal: threadState.streamAbortController?.signal
+      signal: threadState.streamAbortController?.signal,
+      imageData: imageData
     });
 
     const reader = response.body.getReader();
@@ -753,7 +1017,7 @@ const handleSendOrStop = async () => {
 
     // 中断后刷新消息历史，确保显示最新的状态
     try {
-      await fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId });
+      await fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 100 });
       message.info('已中断对话生成');
     } catch (error) {
       console.error('刷新消息历史失败:', error);
@@ -762,6 +1026,106 @@ const handleSendOrStop = async () => {
     return;
   }
   await handleSendMessage();
+};
+
+// ==================== 人工审批处理 ====================
+const handleApprovalWithStream = async (approved) => {
+  console.log('🔄 [STREAM] Starting resume stream processing');
+
+  const threadId = approvalState.threadId;
+  if (!threadId) {
+    message.error('无效的审批请求');
+    approvalState.showModal = false;
+    return;
+  }
+
+  const threadState = getThreadState(threadId);
+  if (!threadState) {
+    message.error('无法找到对应的对话线程');
+    approvalState.showModal = false;
+    return;
+  }
+
+  try {
+    // 使用审批 composable 处理审批
+    const response = await handleApproval(approved, currentAgentId.value);
+
+    if (!response) return; // 如果 handleApproval 抛出错误，这里不会执行
+
+    console.log('🔄 [STREAM] Processing resume streaming response');
+
+    // 处理流式响应
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let stopReading = false;
+
+    while (!stopReading) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (trimmedLine) {
+          try {
+            const chunk = JSON.parse(trimmedLine);
+            console.log('🔄 [STREAM] Processing chunk:', chunk);
+
+            // 处理chunk并更新对话 - _processStreamChunk 已经处理了所有必要的逻辑
+            if (_processStreamChunk(chunk, threadId)) {
+              stopReading = true;
+              break;
+            }
+
+          } catch (e) {
+            console.warn('Failed to parse stream chunk JSON:', e, 'Line:', trimmedLine);
+          }
+        }
+      }
+    }
+
+    if (!stopReading && buffer.trim()) {
+      try {
+        const chunk = JSON.parse(buffer.trim());
+        console.log('🔄 [STREAM] Processing final chunk:', chunk);
+
+        // 处理最终chunk - _processStreamChunk 已经处理了所有必要的逻辑
+        if (_processStreamChunk(chunk, threadId)) {
+          stopReading = true;
+        }
+
+      } catch (e) {
+        console.warn('Failed to parse final stream chunk JSON:', e);
+      }
+    }
+
+    console.log('🔄 [STREAM] Resume stream processing completed');
+
+  } catch (error) {
+    console.error('❌ [STREAM] Resume stream failed:', error);
+    if (error.name !== 'AbortError') {
+      console.error('Resume approval error:', error);
+      // handleChatError 已在 useApproval 中调用
+    }
+  } finally {
+    console.log('🔄 [STREAM] Cleaning up streaming state');
+    if (threadState) {
+      threadState.isStreaming = false;
+      threadState.streamAbortController = null;
+    }
+  }
+};
+
+const handleApprove = () => {
+  handleApprovalWithStream(true);
+};
+
+const handleReject = () => {
+  handleApprovalWithStream(false);
 };
 
 // ==================== UI HANDLERS ====================
@@ -781,10 +1145,17 @@ const handleExampleClick = (questionText) => {
 };
 
 const buildExportPayload = () => {
+  const agentId = currentAgentId.value;
+  let agentDescription = '';
+  if (agentId && agents.value && agents.value.length > 0) {
+    const agent = agents.value.find(a => a.id === agentId);
+    agentDescription = agent ? (agent.description || '') : '';
+  }
+
   const payload = {
     chatTitle: currentThread.value?.title || '新对话',
     agentName: currentAgentName.value || currentAgent.value?.name || '智能助手',
-    agentDescription: currentAgentMetadata.value?.description || currentAgent.value?.description || '',
+    agentDescription: agentDescription || currentAgent.value?.description || '',
     messages: conversations.value ? JSON.parse(JSON.stringify(conversations.value)) : [],
     onGoingMessages: onGoingConvMessages.value ? JSON.parse(JSON.stringify(onGoingConvMessages.value)) : []
   };
@@ -796,10 +1167,8 @@ defineExpose({
   getExportPayload: buildExportPayload
 });
 
-const retryMessage = (msg) => { /* TODO */ };
 const toggleSidebar = () => {
-  uiState.isSidebarOpen = !uiState.isSidebarOpen;
-  localStorage.setItem('chat_sidebar_open', uiState.isSidebarOpen);
+  chatUIStore.toggleSidebar();
 };
 const openAgentModal = () => emit('open-agent-modal');
 
@@ -813,7 +1182,24 @@ const getLastMessage = (conv) => {
 };
 
 const showMsgRefs = (msg) => {
-  if (msg.isLast) return ['copy'];
+  // 如果正在审批中，不显示 refs
+  if (approvalState.showModal) {
+    return false;
+  }
+
+  // 如果当前线程ID与审批线程ID匹配，但审批框已关闭（说明刚刚处理完审批）
+  // 且当前有新的流式处理正在进行，则不显示之前被中断的消息的 refs
+  if (approvalState.threadId &&
+      chatState.currentThreadId === approvalState.threadId &&
+      !approvalState.showModal &&
+      isProcessing) {
+    return false;
+  }
+
+  // 只有真正完成的消息才显示 refs
+  if (msg.isLast && msg.status === 'finished') {
+    return ['copy'];
+  }
   return false;
 };
 
@@ -875,6 +1261,7 @@ watch(currentAgentId, async (newAgentId, oldAgentId) => {
     }
   }
 }, { immediate: true });
+
 
 watch(conversations, () => {
   if (isProcessing.value) {
@@ -1040,10 +1427,23 @@ watch(conversations, () => {
   width: 100%;
   z-index: 9;
   animation: slideInUp 0.5s ease-out;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
 
   span {
-    margin-left: 8px;
     color: var(--gray-700);
+    font-size: 14px;
+  }
+
+  .loading-spinner {
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--gray-200);
+    border-top-color: var(--main-color);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
   }
 }
 
@@ -1335,7 +1735,7 @@ watch(conversations, () => {
 </style>
 
 <style lang="less">
-div.agent-nav-btn {
+.agent-nav-btn {
   display: flex;
   gap: 10px;
   padding: 6px 14px;
@@ -1347,13 +1747,34 @@ div.agent-nav-btn {
   width: auto;
   font-size: 15px;
   transition: background-color 0.3s;
+  border: none;
+  background: transparent;
 
-  &:hover {
+  &:hover:not(.is-disabled) {
     background-color: var(--gray-50);
+  }
+
+  &.is-disabled {
+    cursor: not-allowed;
+    opacity: 0.7;
+    pointer-events: none;
   }
 
   .nav-btn-icon {
     height: 24px;
+  }
+
+  .loading-icon {
+    animation: spin 1s linear infinite;
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 </style>

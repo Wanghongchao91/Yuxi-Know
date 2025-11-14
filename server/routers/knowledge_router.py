@@ -1,6 +1,8 @@
+import aiofiles
 import asyncio
 import os
 import traceback
+from collections.abc import Mapping
 from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
@@ -12,7 +14,7 @@ from server.utils.auth_middleware import get_admin_user
 from server.services.tasker import TaskContext, tasker
 from src import config, knowledge_base
 from src.knowledge.indexing import SUPPORTED_FILE_EXTENSIONS, is_supported_file_extension, process_file_to_markdown
-from src.knowledge.utils import calculate_content_hash
+from src.knowledge.utils import calculate_content_hash, merge_processing_params
 from src.models.embed import test_embedding_model_status, test_all_embedding_models_status
 from src.utils import hashstr, logger
 
@@ -50,6 +52,56 @@ async def create_database(
         f"additional_params {additional_params}, llm_info {llm_info}"
     )
     try:
+        additional_params = {**(additional_params or {})}
+
+        def normalize_reranker_config(kb: str, params: dict) -> None:
+            reranker_cfg = params.get("reranker_config")
+            if kb not in {"chroma", "milvus"}:
+                if kb == "lightrag" and reranker_cfg:
+                    logger.warning("LightRAG does not support reranker, ignoring reranker_config")
+                    params.pop("reranker_config", None)
+                return
+
+            if not reranker_cfg:
+                params["reranker_config"] = {
+                    "enabled": False,
+                    "model": "",
+                    "recall_top_k": 50,
+                    "final_top_k": 10,
+                }
+                return
+
+            if not isinstance(reranker_cfg, Mapping):
+                raise HTTPException(status_code=400, detail="reranker_config must be an object")
+
+            enabled = bool(reranker_cfg.get("enabled", False))
+            model = (reranker_cfg.get("model") or "").strip()
+            recall_top_k = max(1, int(reranker_cfg.get("recall_top_k", 50)))
+            final_top_k = max(1, int(reranker_cfg.get("final_top_k", 10)))
+
+            if enabled:
+                if not model:
+                    raise HTTPException(status_code=400, detail="reranker_config.model is required when enabled")
+                if model not in config.reranker_names:
+                    raise HTTPException(status_code=400, detail=f"Unsupported reranker model: {model}")
+                if final_top_k > recall_top_k:
+                    logger.warning(
+                        f"final_top_k ({final_top_k}) cannot exceed recall_top_k ({recall_top_k}); "
+                        "adjusting recall_top_k to match final_top_k"
+                    )
+                    recall_top_k = final_top_k
+            else:
+                model = model if model in config.reranker_names else ""
+
+            params["reranker_config"] = {
+                "enabled": enabled,
+                "model": model,
+                "recall_top_k": recall_top_k,
+                "final_top_k": final_top_k,
+            }
+
+        normalize_reranker_config(kb_type, additional_params)
+
         embed_info = config.embed_model_names[embed_model_name]
         database_info = await knowledge_base.create_database(
             database_name, description, kb_type=kb_type, embed_info=embed_info, llm_info=llm_info, **additional_params
@@ -77,12 +129,16 @@ async def get_database_info(db_id: str, current_user: User = Depends(get_admin_u
 
 @knowledge.put("/databases/{db_id}")
 async def update_database_info(
-    db_id: str, name: str = Body(...), description: str = Body(...), current_user: User = Depends(get_admin_user)
+    db_id: str,
+    name: str = Body(...),
+    description: str = Body(...),
+    llm_info: dict = Body(None),
+    current_user: User = Depends(get_admin_user),
 ):
     """更新知识库信息"""
-    logger.debug(f"Update database {db_id} info: {name}, {description}")
+    logger.debug(f"Update database {db_id} info: {name}, {description}, llm_info: {llm_info}")
     try:
-        database = await knowledge_base.update_database(db_id, name, description)
+        database = await knowledge_base.update_database(db_id, name, description, llm_info)
         return {"message": "更新成功", "database": database}
     except Exception as e:
         logger.error(f"更新数据库失败 {e}, {traceback.format_exc()}")
@@ -180,11 +236,43 @@ async def add_documents(
                 await context.set_progress(progress, f"正在处理第 {idx}/{total} 个文档")
 
                 # 处理单个文档
-                result = await knowledge_base.add_content(db_id, [item], params=params)
-                processed_items.extend(result)
+                try:
+                    result = await knowledge_base.add_content(db_id, [item], params=params)
+                    processed_items.extend(result)
+                except Exception as doc_error:
+                    # 处理单个文档处理的所有异常（包括超时）
+                    logger.error(f"Document processing failed for {item}: {doc_error}")
+
+                    # 判断是否是超时异常
+                    error_type = "timeout" if isinstance(doc_error, TimeoutError) else "processing_error"
+                    error_msg = "处理超时" if isinstance(doc_error, TimeoutError) else "处理失败"
+
+                    processed_items.append(
+                        {
+                            "item": item,
+                            "status": "failed",
+                            "error": f"{error_msg}: {str(doc_error)}",
+                            "error_type": error_type,
+                        }
+                    )
 
         except asyncio.CancelledError:
             await context.set_progress(100.0, "任务已取消")
+            raise
+        except Exception as task_error:
+            # 处理整体任务的其他异常（如内存不足、网络错误等）
+            logger.exception(f"Task processing failed: {task_error}")
+            await context.set_progress(100.0, f"任务处理失败: {str(task_error)}")
+            # 将所有未处理的文档标记为失败
+            for item in items[len(processed_items) :]:
+                processed_items.append(
+                    {
+                        "item": item,
+                        "status": "failed",
+                        "error": f"任务失败: {str(task_error)}",
+                        "error_type": "task_failed",
+                    }
+                )
             raise
 
         item_type = "URL" if content_type == "url" else "文件"
@@ -271,6 +359,112 @@ async def delete_document(db_id: str, doc_id: str, current_user: User = Depends(
     except Exception as e:
         logger.error(f"删除文档失败 {e}, {traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=f"删除文档失败: {e}")
+
+
+@knowledge.post("/databases/{db_id}/documents/rechunks")
+async def rechunks_documents(
+    db_id: str, file_ids: list[str] = Body(...), params: dict = Body(...), current_user: User = Depends(get_admin_user)
+):
+    """重新分块文档"""
+    logger.debug(f"Rechunks documents for db_id {db_id}: {file_ids} {params=}")
+
+    async def run_rechunks(context: TaskContext):
+        await context.set_message("任务初始化")
+        await context.set_progress(5.0, "准备重新分块文档")
+
+        total = len(file_ids)
+        processed_items = []
+
+        try:
+            # 逐个处理文档并更新进度
+            for idx, file_id in enumerate(file_ids, 1):
+                await context.raise_if_cancelled()
+
+                # 更新进度
+                progress = 5.0 + (idx / total) * 90.0  # 5% ~ 95%
+                await context.set_progress(progress, f"正在重新分块第 {idx}/{total} 个文档")
+
+                # 获取文档元数据中的处理参数
+                metadata_params = None
+                try:
+                    file_info = await knowledge_base.get_file_basic_info(db_id, file_id)
+                    metadata_params = file_info.get("meta", {}).get("processing_params")
+                except Exception as meta_error:
+                    logger.warning(f"Failed to get metadata for file {file_id}: {meta_error}")
+
+                # 合并参数：优先使用请求参数，缺失时使用元数据参数
+                merged_params = merge_processing_params(metadata_params, params)
+
+                # 处理单个文档
+                try:
+                    result = await knowledge_base.update_content(db_id, [file_id], params=merged_params)
+                    processed_items.extend(result)
+                except Exception as doc_error:
+                    # 处理单个文档处理的所有异常（包括超时）
+                    logger.error(f"Document rechunking failed for {file_id}: {doc_error}")
+
+                    # 判断是否是超时异常
+                    error_type = "timeout" if isinstance(doc_error, TimeoutError) else "processing_error"
+                    error_msg = "处理超时" if isinstance(doc_error, TimeoutError) else "处理失败"
+
+                    processed_items.append(
+                        {
+                            "file_id": file_id,
+                            "status": "failed",
+                            "error": f"{error_msg}: {str(doc_error)}",
+                            "error_type": error_type,
+                        }
+                    )
+
+        except asyncio.CancelledError:
+            await context.set_progress(100.0, "任务已取消")
+            raise
+        except Exception as task_error:
+            # 处理整体任务的其他异常（如内存不足、网络错误等）
+            logger.exception(f"Task rechunking failed: {task_error}")
+            await context.set_progress(100.0, f"任务处理失败: {str(task_error)}")
+            # 将所有未处理的文档标记为失败
+            for file_id in file_ids[len(processed_items) :]:
+                processed_items.append(
+                    {
+                        "file_id": file_id,
+                        "status": "failed",
+                        "error": f"任务失败: {str(task_error)}",
+                        "error_type": "task_failed",
+                    }
+                )
+            raise
+
+        failed_count = len([_p for _p in processed_items if _p.get("status") == "failed"])
+        summary = {
+            "db_id": db_id,
+            "submitted": len(processed_items),
+            "failed": failed_count,
+        }
+        message = f"文档重新分块完成，失败 {failed_count} 个" if failed_count else "文档重新分块完成"
+        await context.set_result(summary | {"items": processed_items})
+        await context.set_progress(100.0, message)
+        return summary | {"items": processed_items}
+
+    try:
+        task = await tasker.enqueue(
+            name=f"文档重新分块({db_id})",
+            task_type="knowledge_rechunks",
+            payload={
+                "db_id": db_id,
+                "file_ids": file_ids,
+                "params": params,
+            },
+            coroutine=run_rechunks,
+        )
+        return {
+            "message": "任务已提交，请在任务中心查看进度",
+            "status": "queued",
+            "task_id": task.id,
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to enqueue rechunks task: {e}, {traceback.format_exc()}")
+        return {"message": f"Failed to enqueue task: {e}", "status": "failed"}
 
 
 @knowledge.get("/databases/{db_id}/documents/{doc_id}/download")
@@ -414,6 +608,9 @@ async def get_knowledge_base_query_params(db_id: str, current_user: User = Depen
             raise HTTPException(status_code=404, detail="Database not found")
 
         kb_type = db_info.get("kb_type", "lightrag")
+        metadata = db_info.get("metadata", {}) or {}
+        reranker_config = metadata.get("reranker_config", {}) or {}
+        reranker_enabled = bool(reranker_config.get("enabled", False))
 
         # 根据知识库类型返回不同的查询参数
         if kb_type == "lightrag":
@@ -459,81 +656,141 @@ async def get_knowledge_base_query_params(db_id: str, current_user: User = Depen
                 ],
             }
         elif kb_type == "chroma":
-            params = {
-                "type": "chroma",
-                "options": [
+            top_k_default = reranker_config.get("final_top_k", 10)
+            params_list = [
+                {
+                    "key": "top_k",
+                    "label": "TopK",
+                    "type": "number",
+                    "default": top_k_default,
+                    "min": 1,
+                    "max": 100,
+                    "description": "返回的最大结果数量",
+                },
+                {
+                    "key": "similarity_threshold",
+                    "label": "相似度阈值",
+                    "type": "number",
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "description": "过滤相似度低于此值的结果",
+                },
+                {
+                    "key": "include_distances",
+                    "label": "显示相似度",
+                    "type": "boolean",
+                    "default": True,
+                    "description": "在结果中显示相似度分数",
+                },
+                {
+                    "key": "use_reranker",
+                    "label": "启用重排序",
+                    "type": "boolean",
+                    "default": reranker_enabled,
+                    "description": "是否使用精排模型对检索结果进行重排序",
+                },
+                {
+                    "key": "recall_top_k",
+                    "label": "召回数量",
+                    "type": "number",
+                    "default": reranker_config.get("recall_top_k", 50),
+                    "min": 10,
+                    "max": 200,
+                    "description": "启用重排序时向量检索的候选数量",
+                },
+            ]
+
+            if config.reranker_names:
+                params_list.append(
                     {
-                        "key": "top_k",
-                        "label": "TopK",
-                        "type": "number",
-                        "default": 10,
-                        "min": 1,
-                        "max": 100,
-                        "description": "返回的最大结果数量",
-                    },
-                    {
-                        "key": "similarity_threshold",
-                        "label": "相似度阈值",
-                        "type": "number",
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.1,
-                        "description": "过滤相似度低于此值的结果",
-                    },
-                    {
-                        "key": "include_distances",
-                        "label": "显示相似度",
-                        "type": "boolean",
-                        "default": True,
-                        "description": "在结果中显示相似度分数",
-                    },
-                ],
-            }
-        elif kb_type == "milvus":
-            params = {
-                "type": "milvus",
-                "options": [
-                    {
-                        "key": "top_k",
-                        "label": "TopK",
-                        "type": "number",
-                        "default": 10,
-                        "min": 1,
-                        "max": 100,
-                        "description": "返回的最大结果数量",
-                    },
-                    {
-                        "key": "similarity_threshold",
-                        "label": "相似度阈值",
-                        "type": "number",
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.1,
-                        "description": "过滤相似度低于此值的结果",
-                    },
-                    {
-                        "key": "include_distances",
-                        "label": "显示相似度",
-                        "type": "boolean",
-                        "default": True,
-                        "description": "在结果中显示相似度分数",
-                    },
-                    {
-                        "key": "metric_type",
-                        "label": "距离度量类型",
+                        "key": "reranker_model",
+                        "label": "重排序模型",
                         "type": "select",
-                        "default": "COSINE",
+                        "default": reranker_config.get("model", ""),
                         "options": [
-                            {"value": "COSINE", "label": "余弦相似度", "description": "适合文本语义相似度"},
-                            {"value": "L2", "label": "欧几里得距离", "description": "适合数值型数据"},
-                            {"value": "IP", "label": "内积", "description": "适合标准化向量"},
+                            {"label": info.name, "value": model_id} for model_id, info in config.reranker_names.items()
                         ],
-                        "description": "向量相似度计算方法",
-                    },
-                ],
-            }
+                        "description": "覆盖默认配置，选择用于本次查询的重排序模型",
+                    }
+                )
+
+            params = {"type": "chroma", "options": params_list}
+        elif kb_type == "milvus":
+            top_k_default = reranker_config.get("final_top_k", 10)
+            params_list = [
+                {
+                    "key": "top_k",
+                    "label": "TopK",
+                    "type": "number",
+                    "default": top_k_default,
+                    "min": 1,
+                    "max": 100,
+                    "description": "返回的最大结果数量",
+                },
+                {
+                    "key": "similarity_threshold",
+                    "label": "相似度阈值",
+                    "type": "number",
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.1,
+                    "description": "过滤相似度低于此值的结果",
+                },
+                {
+                    "key": "include_distances",
+                    "label": "显示相似度",
+                    "type": "boolean",
+                    "default": True,
+                    "description": "在结果中显示相似度分数",
+                },
+                {
+                    "key": "metric_type",
+                    "label": "距离度量类型",
+                    "type": "select",
+                    "default": "COSINE",
+                    "options": [
+                        {"value": "COSINE", "label": "余弦相似度", "description": "适合文本语义相似度"},
+                        {"value": "L2", "label": "欧几里得距离", "description": "适合数值型数据"},
+                        {"value": "IP", "label": "内积", "description": "适合标准化向量"},
+                    ],
+                    "description": "向量相似度计算方法",
+                },
+                {
+                    "key": "use_reranker",
+                    "label": "启用重排序",
+                    "type": "boolean",
+                    "default": reranker_enabled,
+                    "description": "是否使用精排模型对检索结果进行重排序",
+                },
+                {
+                    "key": "recall_top_k",
+                    "label": "召回数量",
+                    "type": "number",
+                    "default": reranker_config.get("recall_top_k", 50),
+                    "min": 10,
+                    "max": 200,
+                    "description": "启用重排序时向量检索的候选数量",
+                },
+            ]
+
+            if config.reranker_names:
+                params_list.append(
+                    {
+                        "key": "reranker_model",
+                        "label": "重排序模型",
+                        "type": "select",
+                        "default": reranker_config.get("model", ""),
+                        "options": [
+                            {"label": info.name, "value": model_id} for model_id, info in config.reranker_names.items()
+                        ],
+                        "description": "覆盖默认配置，选择用于本次查询的重排序模型",
+                    }
+                )
+
+            params = {"type": "milvus", "options": params_list}
         else:
             # 未知类型，返回基本参数
             params = {
@@ -593,19 +850,26 @@ async def upload_file(
     basename, ext = os.path.splitext(file.filename)
     filename = f"{basename}_{hashstr(basename, 4, with_salt=True)}{ext}".lower()
     file_path = os.path.join(upload_dir, filename)
-    os.makedirs(upload_dir, exist_ok=True)
+
+    # 在线程池中执行同步文件系统操作，避免阻塞事件循环
+    await asyncio.to_thread(os.makedirs, upload_dir, exist_ok=True)
 
     file_bytes = await file.read()
 
-    content_hash = calculate_content_hash(file_bytes)
-    if knowledge_base.file_existed_in_db(db_id, content_hash):
+    # 在线程池中执行计算密集型操作，避免阻塞事件循环
+    content_hash = await asyncio.to_thread(calculate_content_hash, file_bytes)
+
+    # 在线程池中执行同步数据库查询，避免阻塞事件循环
+    file_exists = await asyncio.to_thread(knowledge_base.file_existed_in_db, db_id, content_hash)
+    if file_exists:
         raise HTTPException(
             status_code=409,
             detail="数据库中已经存在了相同文件，File with the same content already exists in this database",
         )
 
-    with open(file_path, "wb") as buffer:
-        buffer.write(file_bytes)
+    # 使用异步文件写入，避免阻塞事件循环
+    async with aiofiles.open(file_path, "wb") as buffer:
+        await buffer.write(file_bytes)
 
     return {
         "message": "File successfully uploaded",

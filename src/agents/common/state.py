@@ -11,7 +11,7 @@ from langgraph.graph import add_messages
 
 
 @dataclass
-class State:
+class BaseState:
     """Defines the input state for the agent, representing a narrower interface to the outside world.
 
     This class is used to define the initial state and structure of incoming data.

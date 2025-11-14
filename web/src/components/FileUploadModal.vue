@@ -21,21 +21,25 @@
     <div class="add-files-content">
       <div class="upload-header">
         <div class="source-selector">
-          <div class="upload-mode-selector" @click="uploadMode = 'file'" :class="{ active: uploadMode === 'file' }">
-            <FileOutlined /> 上传文件
-          </div>
-          <div class="upload-mode-selector" @click="uploadMode = 'url'" :class="{ active: uploadMode === 'url' }">
-            <LinkOutlined /> 输入网址
-          </div>
+          <a-segmented
+            v-model:value="uploadMode"
+            :options="uploadModeOptions"
+            size="large"
+            class="source-segmented"
+          />
         </div>
         <div class="config-controls">
-          <a-button type="dashed" @click="showChunkConfigModal" v-if="!isGraphBased">
+          <a-button
+            type="dashed"
+            @click="showChunkConfigModal"
+            :disabled="isGraphBased"
+          >
             <SettingOutlined /> 分块参数 ({{ chunkParams.chunk_size }}/{{ chunkParams.chunk_overlap }})
           </a-button>
         </div>
       </div>
 
-      <div class="ocr-config">
+      <div class="ocr-config" v-if="uploadMode === 'file'">
         <a-form layout="horizontal">
           <a-form-item label="使用OCR" name="enable_ocr">
             <div class="ocr-controls">
@@ -63,36 +67,6 @@
                 ✅ {{ selectedOcrMessage }}
               </div>
             </div>
-          </a-form-item>
-        </a-form>
-      </div>
-
-      <div class="qa-split-config" v-if="isQaSplitSupported">
-        <a-form layout="horizontal">
-          <a-form-item label="QA分割模式" name="use_qa_split">
-            <div class="toggle-controls">
-              <a-switch
-                v-model:checked="chunkParams.use_qa_split"
-                style="margin-right: 12px;"
-              />
-              <span class="param-description">
-                {{ chunkParams.use_qa_split ? '启用QA分割（忽略chunk大小设置）' : '使用普通分割模式' }}
-              </span>
-            </div>
-          </a-form-item>
-          <a-form-item
-            v-if="chunkParams.use_qa_split"
-            label="QA分隔符"
-            name="qa_separator"
-          >
-            <a-input
-              v-model:value="chunkParams.qa_separator"
-              placeholder="输入QA分隔符"
-              style="width: 200px; margin-right: 12px;"
-            />
-            <span class="param-description">
-              用于分割不同QA对的分隔符，默认为3个换行符
-            </span>
           </a-form-item>
         </a-form>
       </div>
@@ -150,43 +124,22 @@
       <a-button key="submit" type="primary" @click="handleChunkConfigSubmit">确定</a-button>
     </template>
     <div class="chunk-config-content">
-      <div class="params-info">
-        <p>调整分块参数可以控制文本的切分方式，影响检索质量和文档加载效率。</p>
-      </div>
-      <a-form
-        :model="tempChunkParams"
-        name="chunkConfig"
-        autocomplete="off"
-        layout="vertical"
-      >
-        <a-form-item label="Chunk Size" name="chunk_size">
-          <a-input-number v-model:value="tempChunkParams.chunk_size" :min="100" :max="10000" style="width: 100%;" />
-          <p class="param-description">每个文本片段的最大字符数</p>
-        </a-form-item>
-        <a-form-item label="Chunk Overlap" name="chunk_overlap">
-          <a-input-number v-model:value="tempChunkParams.chunk_overlap" :min="0" :max="1000" style="width: 100%;" />
-          <p class="param-description">相邻文本片段间的重叠字符数</p>
-        </a-form-item>
-        <a-form-item v-if="isQaSplitSupported" label="QA分割模式" name="use_qa_split">
-          <a-switch v-model:checked="tempChunkParams.use_qa_split" />
-          <p class="param-description">启用后将按QA对分割，忽略上述chunk大小设置</p>
-        </a-form-item>
-        <a-form-item v-if="tempChunkParams.use_qa_split && isQaSplitSupported" label="QA分隔符" name="qa_separator">
-          <a-input v-model:value="tempChunkParams.qa_separator" placeholder="输入QA分隔符" style="width: 100%;" />
-          <p class="param-description">用于分割不同QA对的分隔符</p>
-        </a-form-item>
-      </a-form>
+      <ChunkParamsConfig
+        :temp-chunk-params="tempChunkParams"
+        :show-qa-split="isQaSplitSupported"
+      />
     </div>
   </a-modal>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import { message, Upload } from 'ant-design-vue';
 import { useUserStore } from '@/stores/user';
 import { useDatabaseStore } from '@/stores/database';
 import { ocrApi } from '@/apis/system_api';
 import { fileApi } from '@/apis/knowledge_api';
+import ChunkParamsConfig from '@/components/ChunkParamsConfig.vue';
 import {
   FileOutlined,
   LinkOutlined,
@@ -295,6 +248,24 @@ const chunkLoading = computed(() => store.state.chunkLoading);
 
 // 上传模式
 const uploadMode = ref('file');
+const previousOcrSelection = ref('disable');
+
+const uploadModeOptions = computed(() => [
+  {
+    value: 'file',
+    label: h('div', { class: 'segmented-option' }, [
+      h(FileOutlined, { class: 'option-icon' }),
+      h('span', { class: 'option-text' }, '上传文件'),
+    ]),
+  },
+  {
+    value: 'url',
+    label: h('div', { class: 'segmented-option' }, [
+      h(LinkOutlined, { class: 'option-icon' }),
+      h('span', { class: 'option-text' }, '输入网址'),
+    ]),
+  },
+]);
 
 // 文件列表
 const fileList = ref([]);
@@ -347,6 +318,15 @@ const isGraphBased = computed(() => {
 // 计算属性：是否启用了OCR
 const isOcrEnabled = computed(() => {
   return chunkParams.value.enable_ocr !== 'disable';
+});
+
+watch(uploadMode, (mode, previous) => {
+  if (mode === 'url') {
+    previousOcrSelection.value = chunkParams.value.enable_ocr;
+    chunkParams.value.enable_ocr = 'disable';
+  } else if (mode === 'file' && previous === 'url') {
+    chunkParams.value.enable_ocr = previousOcrSelection.value || 'disable';
+  }
 });
 
 // 计算属性：是否有PDF或图片文件
@@ -647,25 +627,7 @@ const chunkData = async () => {
 
 .source-selector {
   display: flex;
-  gap: 12px;
-}
-
-.upload-mode-selector {
-  padding: 8px 16px;
-  border: 1px solid var(--gray-300);
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.3s;
-}
-
-.upload-mode-selector:hover {
-  border-color: var(--main-color);
-}
-
-.upload-mode-selector.active {
-  border-color: var(--main-color);
-  background-color: var(--main-30);
-  color: var(--main-color);
+  align-items: center;
 }
 
 .config-controls {
@@ -673,17 +635,40 @@ const chunkData = async () => {
   align-items: center;
 }
 
-.ocr-config,
-.qa-split-config {
+.source-segmented {
+  background-color: var(--gray-100);
+  border: 1px solid var(--gray-200);
+}
+
+
+.source-segmented :deep(.ant-segmented-item-label) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+  color: var(--gray-600);
+}
+
+.source-segmented :deep(.ant-segmented-item-selected .ant-segmented-item-label) {
+  color: var(--main-color);
+}
+
+.source-segmented :deep(.segmented-option) {
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.source-segmented :deep(.option-icon) {
+  font-size: 14px;
+}
+
+.ocr-config {
   margin-bottom: 20px;
   padding: 16px;
   background-color: var(--gray-50);
   border-radius: 6px;
-}
-
-.toggle-controls {
-  display: flex;
-  align-items: center;
 }
 
 .param-description {

@@ -8,14 +8,12 @@ from lightrag.utils import EmbeddingFunc, setup_logger
 from neo4j import GraphDatabase
 from pymilvus import connections, utility
 
+from src import config
 from src.knowledge.base import KnowledgeBase
 from src.knowledge.indexing import process_file_to_markdown, process_url_to_markdown
 from src.knowledge.utils.kb_utils import get_embedding_config, prepare_item_metadata
 from src.utils import hashstr, logger
 from src.utils.datetime_utils import shanghai_now
-
-LIGHTRAG_LLM_PROVIDER = os.getenv("LIGHTRAG_LLM_PROVIDER", "siliconflow")
-LIGHTRAG_LLM_NAME = os.getenv("LIGHTRAG_LLM_NAME", "zai-org/GLM-4.5-Air")
 
 
 class LightRagKB(KnowledgeBase):
@@ -53,8 +51,8 @@ class LightRagKB(KnowledgeBase):
         """删除数据库，同时清除Milvus和Neo4j中的数据"""
         # Drop Milvus collection
         try:
-            milvus_uri = os.getenv("MILVUS_URI", "http://localhost:19530")
-            milvus_token = os.getenv("MILVUS_TOKEN", "")
+            milvus_uri = os.getenv("MILVUS_URI") or "http://localhost:19530"
+            milvus_token = os.getenv("MILVUS_TOKEN") or ""
             connection_alias = f"lightrag_{hashstr(db_id, 6)}"
 
             connections.connect(alias=connection_alias, uri=milvus_uri, token=milvus_token)
@@ -73,9 +71,9 @@ class LightRagKB(KnowledgeBase):
             logger.error(f"Failed to drop Milvus collection {db_id}: {e}")
 
         # Delete Neo4j data
-        neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-        neo4j_username = os.getenv("NEO4J_USERNAME", "neo4j")
-        neo4j_password = os.getenv("NEO4J_PASSWORD", "0123456789")
+        neo4j_uri = os.getenv("NEO4J_URI") or "bolt://localhost:7687"
+        neo4j_username = os.getenv("NEO4J_USERNAME") or "neo4j"
+        neo4j_password = os.getenv("NEO4J_PASSWORD") or "0123456789"
 
         try:
             driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_username, neo4j_password))
@@ -118,7 +116,7 @@ class LightRagKB(KnowledgeBase):
         if isinstance(metadata.get("language"), str) and metadata.get("language"):
             addon_params.setdefault("language", metadata.get("language"))
         # 默认语言从环境变量读取，默认 English
-        addon_params.setdefault("language", os.getenv("SUMMARY_LANGUAGE", "English"))
+        addon_params.setdefault("language", os.getenv("SUMMARY_LANGUAGE") or "English")
 
         # 创建工作目录
         working_dir = os.path.join(self.work_dir, db_id)
@@ -181,10 +179,8 @@ class LightRagKB(KnowledgeBase):
             model_spec = f"{llm_info['provider']}/{llm_info['model_name']}"
             logger.info(f"Using user-selected LLM: {model_spec}")
         else:
-            provider = LIGHTRAG_LLM_PROVIDER
-            model_name = LIGHTRAG_LLM_NAME
-            model_spec = f"{provider}/{model_name}"
-            logger.info(f"Using default LLM from environment: {provider}/{model_name}")
+            model_spec = config.default_model
+            logger.info(f"Using default LLM from environment: {model_spec}")
 
         model = select_model(model_spec=model_spec)
 
@@ -230,7 +226,7 @@ class LightRagKB(KnowledgeBase):
 
         for item in items:
             # 准备文件元数据
-            metadata = prepare_item_metadata(item, content_type, db_id)
+            metadata = prepare_item_metadata(item, content_type, db_id, params=params)
             file_id = metadata["file_id"]
             item_path = metadata["path"]
 
@@ -274,6 +270,91 @@ class LightRagKB(KnowledgeBase):
 
         return processed_items_info
 
+    async def update_content(self, db_id: str, file_ids: list[str], params: dict | None = None) -> list[dict]:
+        """更新内容 - 根据file_ids重新解析文件并更新向量库"""
+        if db_id not in self.databases_meta:
+            raise ValueError(f"Database {db_id} not found")
+
+        rag = await self._get_lightrag_instance(db_id)
+        if not rag:
+            raise ValueError(f"Failed to get LightRAG instance for {db_id}")
+
+        # 处理默认参数
+        if params is None:
+            params = {}
+        content_type = params.get("content_type", "file")
+        processed_items_info = []
+
+        for file_id in file_ids:
+            # 从元数据中获取文件信息
+            if file_id not in self.files_meta:
+                logger.warning(f"File {file_id} not found in metadata, skipping")
+                continue
+
+            file_meta = self.files_meta[file_id]
+            file_path = file_meta.get("path")
+
+            if not file_path:
+                logger.warning(f"File path not found for {file_id}, skipping")
+                continue
+
+            # 添加到处理队列
+            self._add_to_processing_queue(file_id)
+
+            try:
+                # 更新状态为处理中
+                self.files_meta[file_id]["processing_params"] = params.copy()
+                self.files_meta[file_id]["status"] = "processing"
+                self._save_metadata()
+
+                # 重新解析文件为 markdown
+                if content_type == "file":
+                    markdown_content = await process_file_to_markdown(file_path, params=params)
+                    markdown_content_lines = markdown_content[:100].replace("\n", " ")
+                    logger.info(f"Markdown content: {markdown_content_lines}...")
+                else:
+                    markdown_content = await process_url_to_markdown(file_path, params=params)
+
+                # 先删除现有的 LightRAG 数据（仅删除chunks，保留元数据）
+                await self.delete_file_chunks_only(db_id, file_id)
+
+                # 使用 LightRAG 重新插入内容
+                await rag.ainsert(input=markdown_content, ids=file_id, file_paths=file_path)
+
+                logger.info(f"Updated {content_type} {file_path} in LightRAG. Done.")
+
+                # 更新元数据状态
+                self.files_meta[file_id]["status"] = "done"
+                self._save_metadata()
+
+                # 从处理队列中移除
+                self._remove_from_processing_queue(file_id)
+
+                # 返回更新后的文件信息
+                updated_file_meta = file_meta.copy()
+                updated_file_meta["status"] = "done"
+                updated_file_meta["file_id"] = file_id
+                processed_items_info.append(updated_file_meta)
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"更新{content_type} {file_path} 失败: {error_msg}, {traceback.format_exc()}")
+                self.files_meta[file_id]["status"] = "failed"
+                self.files_meta[file_id]["error"] = error_msg
+                self._save_metadata()
+
+                # 从处理队列中移除
+                self._remove_from_processing_queue(file_id)
+
+                # 返回失败的文件信息
+                failed_file_meta = file_meta.copy()
+                failed_file_meta["status"] = "failed"
+                failed_file_meta["file_id"] = file_id
+                failed_file_meta["error"] = error_msg
+                processed_items_info.append(failed_file_meta)
+
+        return processed_items_info
+
     async def aquery(self, query_text: str, db_id: str, **kwargs) -> str:
         """异步查询知识库"""
         rag = await self._get_lightrag_instance(db_id)
@@ -299,15 +380,22 @@ class LightRagKB(KnowledgeBase):
             logger.error(f"Query error: {e}, {traceback.format_exc()}")
             return ""
 
-    async def delete_file(self, db_id: str, file_id: str) -> None:
-        """删除文件"""
+    async def delete_file_chunks_only(self, db_id: str, file_id: str) -> None:
+        """仅删除文件的chunks数据，保留元数据（用于更新操作）"""
         rag = await self._get_lightrag_instance(db_id)
         if rag:
             try:
                 # 使用 LightRAG 删除文档
                 await rag.adelete_by_doc_id(file_id)
+                logger.info(f"Deleted chunks for file {file_id} from LightRAG")
             except Exception as e:
                 logger.error(f"Error deleting file {file_id} from LightRAG: {e}")
+        # 注意：这里不删除 files_meta[file_id]，保留元数据用于后续操作
+
+    async def delete_file(self, db_id: str, file_id: str) -> None:
+        """删除文件（包括元数据）"""
+        # 先删除 LightRAG 中的 chunks 数据
+        await self.delete_file_chunks_only(db_id, file_id)
 
         # 删除文件记录
         if file_id in self.files_meta:
@@ -332,8 +420,12 @@ class LightRagKB(KnowledgeBase):
         if rag:
             try:
                 # 获取文档的所有 chunks
-                assert hasattr(rag.text_chunks, "get_all"), "text_chunks does not have get_all method"
-                all_chunks = await rag.text_chunks.get_all()  # type: ignore
+                # LightRAG v1.4+ 使用 JsonKVStorage，通过 _data 属性访问所有数据
+                if hasattr(rag.text_chunks, "_data"):
+                    all_chunks = dict(rag.text_chunks._data)
+                else:
+                    logger.warning("text_chunks does not have _data attribute, cannot get file content")
+                    return content_info
 
                 # 筛选属于该文档的 chunks
                 doc_chunks = []

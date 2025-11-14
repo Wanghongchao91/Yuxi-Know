@@ -22,7 +22,7 @@ def load_chat_model(fully_specified_name: str, **kwargs) -> BaseChatModel:
 
     env_var = model_info.env
 
-    api_key = os.getenv(env_var, env_var)
+    api_key = os.getenv(env_var) or env_var
 
     base_url = get_docker_safe_url(model_info.base_url)
 
@@ -36,16 +36,6 @@ def load_chat_model(fully_specified_name: str, **kwargs) -> BaseChatModel:
             api_base=base_url,
             stream_usage=True,
         )
-
-    # elif provider == "together":
-    #     from langchain_together import ChatTogether
-
-    #     return ChatTogether(
-    #         model=model,
-    #         api_key=SecretStr(api_key),
-    #         base_url=base_url,
-    #         stream_usage=True,
-    #     )
 
     else:
         try:  # 其他模型，默认使用OpenAIBase, like openai, zhipuai

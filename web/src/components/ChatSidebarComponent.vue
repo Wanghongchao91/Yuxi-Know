@@ -1,5 +1,5 @@
 <template>
-  <div class="chat-sidebar" :class="{'sidebar-open': isSidebarOpen, 'no-transition': isInitialRender}">
+  <div class="chat-sidebar" :class="{'sidebar-open': chatUIStore.isSidebarOpen, 'no-transition': isInitialRender}">
     <div class="sidebar-content">
       <div class="sidebar-header">
         <div class="header-title" v-if="singleMode">{{ selectedAgentName }}</div>
@@ -12,14 +12,16 @@
           <ChevronDown size="16" class="switch-icon" />
         </div>
         <div class="header-actions">
-          <div class="toggle-sidebar nav-btn" v-if="isSidebarOpen" @click="toggleCollapse">
+          <div class="toggle-sidebar nav-btn" v-if="chatUIStore.isSidebarOpen" @click="toggleCollapse">
             <PanelLeftClose size="20" color="var(--gray-800)"/>
           </div>
         </div>
       </div>
       <div class="conversation-list-top">
-        <button type="text" @click="createNewChat" class="new-chat-btn">
-          <MessageSquarePlus size="20" /> 创建新对话
+        <button type="text" @click="createNewChat" class="new-chat-btn" :disabled="chatUIStore.creatingNewChat">
+          <LoaderCircle v-if="chatUIStore.creatingNewChat" size="20" class="loading-icon" />
+          <MessageSquarePlus v-else size="20" />
+          创建新对话
         </button>
       </div>
       <div class="conversation-list">
@@ -42,7 +44,7 @@
                       <a-menu-item key="rename" @click.stop="renameChat(chat.id)">
                         <EditOutlined /> 重命名
                       </a-menu-item>
-                      <a-menu-item key="delete" @click.stop="deleteChat(chat.id)" v-if="chat.id !== currentChatId">
+                      <a-menu-item key="delete" @click.stop="deleteChat(chat.id)">
                         <DeleteOutlined /> 删除
                       </a-menu-item>
                     </a-menu>
@@ -71,8 +73,12 @@ import {
   MoreOutlined
 } from '@ant-design/icons-vue';
 import { message, Modal } from 'ant-design-vue';
-import { PanelLeftClose, MessageSquarePlus, ChevronDown } from 'lucide-vue-next';
+import { PanelLeftClose, MessageSquarePlus, ChevronDown, LoaderCircle } from 'lucide-vue-next';
 import dayjs, { parseToShanghai } from '@/utils/time';
+import { useChatUIStore } from '@/stores/chatUI';
+
+// 使用 chatUI store
+const chatUIStore = useChatUIStore();
 
 const props = defineProps({
   currentAgentId: {
@@ -87,10 +93,6 @@ const props = defineProps({
     type: Array,
     default: () => []
   },
-  isSidebarOpen: {
-    type: Boolean,
-    default: false
-  },
   isInitialRender: {
     type: Boolean,
     default: false
@@ -100,8 +102,8 @@ const props = defineProps({
     default: true
   },
   agents: {
-    type: Object,
-    default: () => ({})
+    type: Array,
+    default: () => []
   },
   selectedAgentId: {
     type: String,
@@ -112,8 +114,9 @@ const props = defineProps({
 const emit = defineEmits(['create-chat', 'select-chat', 'delete-chat', 'rename-chat', 'toggle-sidebar', 'open-agent-modal']);
 
 const selectedAgentName = computed(() => {
-  if (props.selectedAgentId && props.agents && props.agents[props.selectedAgentId]) {
-    return props.agents[props.selectedAgentId].name;
+  if (props.selectedAgentId && props.agents && props.agents.length > 0) {
+    const agent = props.agents.find(a => a.id === props.selectedAgentId);
+    return agent ? agent.name : '';
   }
   return '';
 });
@@ -301,10 +304,10 @@ const openAgentModal = () => {
     .new-chat-btn {
       width: 100%;
       padding: 8px 12px;
-      border-radius: 6px;
-      background-color: var(--gray-50);
+      border-radius: 8px;
+      background-color: var(--gray-0);
       color: var(--main-color);
-      border: none;
+      border: 1px solid var(--gray-150);
       transition: all 0.2s ease;
       font-weight: 500;
       cursor: pointer;
@@ -312,10 +315,29 @@ const openAgentModal = () => {
       align-items: center;
       justify-content: center;
       gap: 8px;
+      box-shadow: 0 3px 4px rgba(0, 10, 20, 0.02);
 
-      &:hover {
-        background-color: var(--gray-100);
+      &:hover:not(:disabled) {
+        box-shadow: 0 3px 4px rgba(0, 10, 20, 0.07);
       }
+
+      &:disabled {
+        cursor: not-allowed;
+        opacity: 0.7;
+      }
+
+      .loading-icon {
+        animation: spin 1s linear infinite;
+      }
+    }
+  }
+
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
     }
   }
 

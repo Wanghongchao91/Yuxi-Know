@@ -17,12 +17,7 @@ export const useDatabaseStore = defineStore('database', () => {
 
   const queryParams = ref([]);
   const meta = reactive({});
-  const graphStats = ref({
-    displayed_nodes: 0,
-    displayed_edges: 0,
-    is_truncated: false,
-  });
-  const selectedRowKeys = ref([]);
+    const selectedRowKeys = ref([]);
 
   const state = reactive({
     databaseLoading: false,
@@ -35,7 +30,6 @@ export const useDatabaseStore = defineStore('database', () => {
     chunkLoading: false,
     autoRefresh: false,
     queryParamsLoading: false,
-    isGraphMaximized: false,
     rightPanelVisible: true,
   });
 
@@ -44,7 +38,7 @@ export const useDatabaseStore = defineStore('database', () => {
   let autoRefreshManualOverride = false; // Indicates user explicitly disabled auto-refresh
 
   // Actions
-  async function getDatabaseInfo(id) {
+  async function getDatabaseInfo(id, skipQueryParams = false) {
     const db_id = id || databaseId.value;
     if (!db_id) return;
 
@@ -54,7 +48,11 @@ export const useDatabaseStore = defineStore('database', () => {
       const data = await databaseApi.getDatabaseInfo(db_id);
       database.value = data;
       ensureAutoRefreshForProcessing(data?.files);
-      await loadQueryParams(db_id);
+
+      // Only load query parameters if explicitly requested or if not loaded yet
+      if (!skipQueryParams && queryParams.value.length === 0) {
+        await loadQueryParams(db_id);
+      }
     } catch (error) {
       console.error(error);
       message.error(error.message || '获取数据库信息失败');
@@ -69,7 +67,7 @@ export const useDatabaseStore = defineStore('database', () => {
       state.lock = true;
       await databaseApi.updateDatabase(databaseId.value, formData);
       message.success('知识库信息更新成功');
-      await getDatabaseInfo();
+      await getDatabaseInfo(); // Load query params after updating database info
     } catch (error) {
       console.error(error);
       message.error(error.message || '更新失败');
@@ -104,7 +102,7 @@ export const useDatabaseStore = defineStore('database', () => {
     state.lock = true;
     try {
       await documentApi.deleteDocument(databaseId.value, fileId);
-      await getDatabaseInfo();
+      await getDatabaseInfo(undefined, true); // Skip query params for file deletion
     } catch (error) {
       console.error(error);
       message.error(error.message || '删除失败');
@@ -171,7 +169,7 @@ export const useDatabaseStore = defineStore('database', () => {
             message.error(`${failureCount} 个文件删除失败`);
           }
           selectedRowKeys.value = [];
-          await getDatabaseInfo();
+          await getDatabaseInfo(undefined, true); // Skip query params for batch deletion
         } catch (error) {
           progressMessage?.();
           console.error('批量删除出错:', error);
@@ -243,7 +241,46 @@ export const useDatabaseStore = defineStore('database', () => {
             }
           });
         }
-        await getDatabaseInfo();
+        await getDatabaseInfo(undefined, true); // Skip query params when adding files
+        return true; // Indicate success
+      } else {
+        message.error(data.message || '处理失败');
+        return false;
+      }
+    } catch (error) {
+      console.error(error);
+      message.error(error.message || '处理请求失败');
+      return false;
+    } finally {
+      state.chunkLoading = false;
+    }
+  }
+
+  async function rechunksFiles({ fileIds, params }) {
+    if (fileIds.length === 0) {
+      message.error('请选择要重新分块的文件！');
+      return;
+    }
+
+    state.chunkLoading = true;
+    try {
+      const data = await documentApi.rechunksDocuments(databaseId.value, fileIds, { ...params });
+      if (data.status === 'success' || data.status === 'queued') {
+        enableAutoRefresh('auto');
+        message.success(data.message || `文档已提交处理，请在任务中心查看进度`);
+        if (data.task_id) {
+          taskerStore.registerQueuedTask({
+            task_id: data.task_id,
+            name: `文档重新分块 (${databaseId.value || ''})`,
+            task_type: 'knowledge_rechunks',
+            message: data.message,
+            payload: {
+              db_id: databaseId.value,
+              count: fileIds.length,
+            }
+          });
+        }
+        await getDatabaseInfo(undefined, true); // Skip query params when adding files
         return true; // Indicate success
       } else {
         message.error(data.message || '处理失败');
@@ -324,7 +361,7 @@ export const useDatabaseStore = defineStore('database', () => {
   function startAutoRefresh() {
     if (state.autoRefresh && !refreshInterval) {
       refreshInterval = setInterval(() => {
-        getDatabaseInfo();
+        getDatabaseInfo(undefined, true); // Skip loading query params during auto-refresh
       }, 1000);
     }
   }
@@ -372,7 +409,6 @@ export const useDatabaseStore = defineStore('database', () => {
     selectedFile,
     queryParams,
     meta,
-    graphStats,
     selectedRowKeys,
     state,
     getDatabaseInfo,
@@ -382,6 +418,7 @@ export const useDatabaseStore = defineStore('database', () => {
     handleDeleteFile,
     handleBatchDelete,
     addFiles,
+    rechunksFiles,
     openFileDetail,
     loadQueryParams,
 

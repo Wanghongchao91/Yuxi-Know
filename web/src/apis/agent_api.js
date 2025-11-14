@@ -1,4 +1,4 @@
-import { apiGet, apiPost, apiDelete, apiPut, apiAdminGet, apiAdminPost } from './base'
+import { apiGet, apiPost, apiDelete, apiPut, apiAdminGet, apiAdminPost, apiRequest } from './base'
 import { useUserStore } from '@/stores/user'
 
 /**
@@ -137,9 +137,57 @@ export const agentApi = {
    * 获取所有可用工具的信息
    * @returns {Promise} - 工具信息列表
    */
-  getTools: (agentId) => apiGet(`/api/chat/tools?agent_id=${agentId}`)
+  getTools: (agentId) => apiGet(`/api/chat/tools?agent_id=${agentId}`),
+
+  /**
+   * 恢复被人工审批中断的对话（流式响应）
+   * @param {string} agentId - 智能体ID
+   * @param {Object} data - 恢复数据 { thread_id, approved }
+   * @param {Object} options - 可选参数（signal, headers等）
+   * @returns {Promise} - 恢复响应流
+   */
+  resumeAgentChat: (agentId, data, options = {}) => {
+    const { signal, headers: extraHeaders, ...restOptions } = options || {};
+    const baseHeaders = {
+      'Content-Type': 'application/json',
+      ...useUserStore().getAuthHeaders()
+    };
+
+    return fetch(`/api/chat/agent/${agentId}/resume`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+      signal,
+      headers: {
+        ...baseHeaders,
+        ...(extraHeaders || {})
+      },
+      ...restOptions
+    })
+  }
 }
 
+
+// =============================================================================
+// === 多模态图片支持分组 ===
+// =============================================================================
+
+export const multimodalApi = {
+  /**
+   * 上传图片并获取base64编码
+   * @param {File} file - 图片文件
+   * @returns {Promise} - 上传结果
+   */
+  uploadImage: (file) => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    return apiRequest('/api/chat/image/upload', {
+      method: 'POST',
+      body: formData,
+    }, true);
+  },
+
+  };
 
 // =============================================================================
 // === 对话线程分组 ===
@@ -186,5 +234,35 @@ export const threadApi = {
    * @param {string} threadId - 对话线程ID
    * @returns {Promise} - 删除结果
    */
-  deleteThread: (threadId) => apiDelete(`/api/chat/thread/${threadId}`)
+  deleteThread: (threadId) => apiDelete(`/api/chat/thread/${threadId}`),
+
+  /**
+   * 获取线程附件列表
+   * @param {string} threadId - 对话线程ID
+   * @returns {Promise}
+   */
+  getThreadAttachments: (threadId) => apiGet(`/api/chat/thread/${threadId}/attachments`),
+
+  /**
+   * 上传附件
+   * @param {string} threadId
+   * @param {File} file
+   * @returns {Promise}
+   */
+  uploadThreadAttachment: (threadId, file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest(`/api/chat/thread/${threadId}/attachments`, {
+      method: 'POST',
+      body: formData
+    })
+  },
+
+  /**
+   * 删除附件
+   * @param {string} threadId
+   * @param {string} fileId
+   * @returns {Promise}
+   */
+  deleteThreadAttachment: (threadId, fileId) => apiDelete(`/api/chat/thread/${threadId}/attachments/${fileId}`)
 };
