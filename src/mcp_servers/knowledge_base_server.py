@@ -232,8 +232,21 @@ class KnowledgeBaseServer:
             # Execute query
             if db_id:
                 # Query specific database
-                result = await knowledge_base.aquery(query_text, db_id=db_id, **query_params)
-                source_info = f"Database: {db_id}"
+                try:
+                    result = await knowledge_base.aquery(query_text, db_id=db_id, **query_params)
+                    source_info = f"Database: {db_id}"
+                except Exception as e:
+                    logger.error(f"Error querying specific database {db_id}: {e}")
+                    error_msg = f"Database {db_id} not found or query failed: {str(e)}"
+                    if "not found" in str(e).lower():
+                        error_msg += f"\n\nDatabase '{db_id}' does not exist. Please call list_knowledge_bases first to get available database IDs."
+                    return CallToolResult(
+                        content=[TextContent(
+                            type="text",
+                            text=error_msg
+                        )],
+                        isError=True
+                    )
             else:
                 # Query all databases and aggregate results
                 retrievers = knowledge_base.get_retrievers()
@@ -264,24 +277,39 @@ class KnowledgeBaseServer:
                 source_info = f"Searched {len(retrievers)} databases"
             
             # Handle empty or invalid results
-            if result is None:
+            if result is None or result == "":
                 result = []
             elif isinstance(result, str):
                 # If result is already a string, try to parse it as JSON
-                try:
-                    parsed_result = json.loads(result)
-                    result = parsed_result
-                except json.JSONDecodeError:
-                    # If it's not valid JSON, wrap it in a simple structure
-                    result = [{"text": result, "type": "text"}]
+                if result.strip() == "":
+                    # Handle empty string case
+                    result = []
+                else:
+                    try:
+                        parsed_result = json.loads(result)
+                        result = parsed_result
+                    except json.JSONDecodeError:
+                        # If it's not valid JSON, wrap it in a simple structure
+                        result = [{"text": result, "type": "text"}]
             
-            # Ensure result is JSON-serializable
+            # Ensure result is JSON-serializable with proper fallback
             try:
                 result_text = json.dumps(result, ensure_ascii=False)
             except (TypeError, ValueError) as json_error:
-                # If result can't be JSON serialized, convert to string representation
-                result_text = str(result)
-                logger.warning(f"Result could not be JSON serialized, using string representation: {json_error}")
+                # If result can't be JSON serialized, create a safe fallback
+                logger.warning(f"Result could not be JSON serialized, using fallback: {json_error}")
+                try:
+                    # Try to convert to a basic structure
+                    if isinstance(result, (list, tuple)):
+                        result_text = json.dumps([str(item) for item in result], ensure_ascii=False)
+                    elif isinstance(result, dict):
+                        result_text = json.dumps({str(k): str(v) for k, v in result.items()}, ensure_ascii=False)
+                    else:
+                        result_text = json.dumps([{"text": str(result), "type": "text"}], ensure_ascii=False)
+                except Exception as fallback_error:
+                    # Last resort: return empty array as JSON
+                    result_text = "[]"
+                    logger.error(f"Even fallback serialization failed: {fallback_error}")
             
             return CallToolResult(
                 content=[TextContent(
@@ -293,11 +321,18 @@ class KnowledgeBaseServer:
         except Exception as e:
             logger.error(f"Error in _query_knowledge_base: {e}", exc_info=True)
             error_msg = f"Error querying knowledge base: {str(e)}"
+            
+            # Provide specific guidance based on error type
             if "Expecting value" in str(e):
-                error_msg += "\n\nThis usually means the knowledge base returned empty or invalid results. Try:\n"
-                error_msg += "1. Check if the database ID is correct using list_knowledge_bases\n"
-                error_msg += "2. Try a different search term\n"
-                error_msg += "3. Use a different query mode (local, global, hybrid, naive, mix)"
+                error_msg += "\n\nThis error usually means the knowledge base returned empty or invalid JSON results. Try:\n"
+                error_msg += "1. Check if the database ID is correct using list_knowledge_bases first\n"
+                error_msg += "2. Verify the database exists and contains data\n"
+                error_msg += "3. Try a different search term or query mode (local, global, hybrid, naive, mix)\n"
+                error_msg += "4. Check if the database was properly initialized"
+            elif "not found" in str(e).lower():
+                error_msg += "\n\nDatabase not found. Please call list_knowledge_bases to get available database IDs."
+            elif "empty" in str(e).lower() or "none" in str(e).lower():
+                error_msg += "\n\nQuery returned no results. Try a different search term or check if the database contains data."
             
             return CallToolResult(
                 content=[TextContent(
