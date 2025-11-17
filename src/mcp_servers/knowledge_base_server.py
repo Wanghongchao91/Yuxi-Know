@@ -211,235 +211,51 @@ class KnowledgeBaseServer:
                 )
     
     async def _query_knowledge_base(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Query knowledge base with given arguments - supports batch queries and reranking"""
+        """Query a single knowledge base and return raw output without reranking"""
         try:
-            # Support both single query text and array of query texts
             query_text_input = arguments.get("query_text", "")
-            db_id_input = arguments.get("db_id")
+            db_id = arguments.get("db_id")
             mode = arguments.get("mode", "mix")
             top_k = arguments.get("top_k", 10)
-            # 使用内部默认配置，用户不需要看到这些参数
-            enable_rerank = arguments.get("enable_rerank", RerankConfig.DEFAULT_ENABLE_RERANK)
-            rerank_model = arguments.get("rerank_model", RerankConfig.DEFAULT_RERANK_MODEL)
-            rerank_strategy = arguments.get("rerank_strategy", RerankConfig.DEFAULT_RERANK_STRATEGY)
-            kg_weight = arguments.get("kg_weight", RerankConfig.DEFAULT_KG_WEIGHT)
-            diversity_boost = arguments.get("diversity_boost", RerankConfig.DEFAULT_DIVERSITY_BOOST)
-            
-            # Normalize query texts to list
-            if isinstance(query_text_input, str):
-                query_texts = [query_text_input]
-            elif isinstance(query_text_input, list):
-                query_texts = query_text_input
-            else:
-                query_texts = [str(query_text_input)]
-            
-            if not query_texts or not query_texts[0]:
+
+            if isinstance(query_text_input, list):
+                if len(query_text_input) != 1:
+                    return CallToolResult(
+                        content=[TextContent(type="text", text="Error: only one query_text is allowed")],
+                        isError=True
+                    )
+                query_text_input = query_text_input[0]
+
+            if not isinstance(query_text_input, str) or not query_text_input.strip():
                 return CallToolResult(
-                    content=[TextContent(
-                        type="text",
-                        text="Error: query_text is required"
-                    )],
+                    content=[TextContent(type="text", text="Error: query_text is required")],
                     isError=True
                 )
-            
-            # Normalize db_ids to list
-            if db_id_input is None:
-                db_ids = None  # Query all databases
-            elif isinstance(db_id_input, str):
-                db_ids = [db_id_input]
-            elif isinstance(db_id_input, list) and db_id_input:
-                db_ids = db_id_input
+
+            if not isinstance(db_id, str) or not db_id.strip():
+                return CallToolResult(
+                    content=[TextContent(type="text", text="Error: db_id is required. Call list_knowledge_bases to get available IDs")],
+                    isError=True
+                )
+
+            raw_result = await knowledge_base.aquery(query_text_input, db_id=db_id, mode=mode, top_k=top_k)
+
+            if raw_result is None or raw_result == "":
+                return CallToolResult(
+                    content=[TextContent(type="text", text="No results")],
+                    isError=True
+                )
+
+            if isinstance(raw_result, (dict, list)):
+                text_out = json.dumps(raw_result, ensure_ascii=False, indent=2)
             else:
-                db_ids = None  # Query all databases
-            
-            # Prepare query parameters
-            query_params = {
-                "mode": mode,
-                "top_k": top_k
-            }
-            
-            # Collect all results from all queries
-            all_results = []
-            query_metadata = {
-                "total_queries": len(query_texts),
-                "databases_queried": [],
-                "rerank_enabled": enable_rerank,
-                "mixed_data_detected": False  # 将在后续处理中更新
-                # 内部参数不暴露给用户：rerank_model, rerank_strategy, kg_weight, diversity_boost
-            }
-            
-            # Execute queries for each query text
-            for query_idx, query_text in enumerate(query_texts):
-                if db_ids:
-                    # Query specific databases
-                    for db_id in db_ids:
-                        try:
-                            result = await knowledge_base.aquery(query_text, db_id=db_id, **query_params)
-                            if result and db_id not in query_metadata["databases_queried"]:
-                                query_metadata["databases_queried"].append(db_id)
-                            
-                            # Process and add source info
-                            processed_results = self._process_query_result(result, db_id, f"Database: {db_id}")
-                            for item in processed_results:
-                                item["query_index"] = query_idx
-                                item["original_query"] = query_text
-                            all_results.extend(processed_results)
-                            
-                        except Exception as e:
-                            logger.warning(f"Error querying database {db_id} with query '{query_text}': {e}")
-                            continue
-                else:
-                    # Query all databases
-                    retrievers = knowledge_base.get_retrievers()
-                    query_metadata["databases_queried"] = list(retrievers.keys())
-                    
-                    for current_db_id, retriever_info in retrievers.items():
-                        try:
-                            db_result = await knowledge_base.aquery(query_text, db_id=current_db_id, **query_params)
-                            
-                            # Process and add source info
-                            processed_results = self._process_query_result(
-                                db_result, current_db_id, retriever_info.get("name", current_db_id)
-                            )
-                            for item in processed_results:
-                                item["query_index"] = query_idx
-                                item["original_query"] = query_text
-                            all_results.extend(processed_results)
-                            
-                        except Exception as e:
-                            logger.warning(f"Error querying database {current_db_id} with query '{query_text}': {e}")
-                            continue
-            
-            # Apply reranking if enabled and we have multiple results
-            if enable_rerank and len(all_results) > 1:
-                try:
-                    # Check if this is knowledge graph data and apply specialized reranking
-                    if rerank_strategy == "auto":
-                        # 分析结果类型分布
-                        text_results = []
-                        kg_results = []
-                        
-                        for result in all_results:
-                            content = result.get("content", {})
-                            if isinstance(content, dict) and ("entity" in content or "entity1" in content):
-                                kg_results.append(result)
-                            else:
-                                text_results.append(result)
-                        
-                        # 混合重排策略
-                        if kg_results and text_results:
-                            # 既有知识图谱又有文档数据，采用混合重排
-                            logger.info(f"Mixed data detected: {len(kg_results)} KG results, {len(text_results)} text results")
-                            query_metadata["mixed_data_detected"] = True
-                            
-                            # 分别重排两类数据
-                            if text_results:
-                                text_results = await self._rerank_text_results(text_results, rerank_model)
-                            if kg_results:
-                                kg_results = await self._rerank_knowledge_graph_results(kg_results, rerank_model)
-                            
-                            # 合并结果，使用归一化分数确保公平比较
-                            all_results = self._merge_mixed_results(text_results, kg_results, query_texts, 
-                                                                   kg_weight=kg_weight, diversity_boost=diversity_boost)
-                            
-                        elif kg_results:
-                            # 只有知识图谱数据
-                            all_results = await self._rerank_knowledge_graph_results(all_results, rerank_model)
-                        else:
-                            # 只有文本数据
-                            all_results = await self._rerank_text_results(all_results, rerank_model)
-                    elif rerank_strategy == "knowledge_graph":
-                        # Force knowledge graph reranking
-                        all_results = await self._rerank_knowledge_graph_results(all_results, rerank_model)
-                    elif rerank_strategy == "mixed":
-                        # 强制混合重排，不管数据类型如何
-                        query_metadata["mixed_data_detected"] = True  # 标记为混合数据
-                        text_results = []
-                        kg_results = []
-                        
-                        for result in all_results:
-                            content = result.get("content", {})
-                            if isinstance(content, dict) and ("entity" in content or "entity1" in content):
-                                kg_results.append(result)
-                            else:
-                                text_results.append(result)
-                        
-                        # 分别重排两类数据
-                        if text_results:
-                            text_results = await self._rerank_text_results(text_results, rerank_model)
-                        if kg_results:
-                            kg_results = await self._rerank_knowledge_graph_results(kg_results, rerank_model)
-                        
-                        # 合并结果
-                        all_results = self._merge_mixed_results(text_results, kg_results, query_texts, 
-                                                               kg_weight=kg_weight, diversity_boost=diversity_boost)
-                    else:
-                        # Standard text reranking
-                        all_results = await self._rerank_text_results(all_results, rerank_model)
-                        
-                except Exception as e:
-                    logger.warning(f"Reranking failed: {e}. Using original results order.")
-            
-            # Limit results to top_k
-            final_results = all_results[:top_k]
-            
-            # Add metadata to results (简化用户可见的元数据)
-            simplified_metadata = {
-                "total_queries": query_metadata["total_queries"],
-                "databases_queried": query_metadata["databases_queried"],
-                "total_results": len(final_results),
-                "data_types": list(set(r.get("data_type", "text") for r in final_results)) if final_results else ["text"]
-            }
-            
-            # 只在混合数据时显示额外信息
-            if query_metadata.get("mixed_data_detected", False):
-                simplified_metadata["mixed_data_detected"] = True
-            
-            result_data = {
-                "results": final_results,
-                "metadata": simplified_metadata
-            }
-            
-            # Ensure result is JSON-serializable
-            try:
-                result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
-            except (TypeError, ValueError) as json_error:
-                logger.warning(f"Result could not be JSON serialized: {json_error}")
-                # Fallback to basic structure
-                fallback_data = {
-                    "results": [{"text": str(result), "type": "text"} for result in final_results],
-                    "metadata": {"error": "JSON serialization failed, using fallback"}
-                }
-                result_text = json.dumps(fallback_data, ensure_ascii=False)
-            
-            return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=result_text
-                )]
-            )
-            
+                text_out = str(raw_result)
+
+            return CallToolResult(content=[TextContent(type="text", text=text_out)])
+
         except Exception as e:
-            logger.error(f"Error in _query_knowledge_base: {e}", exc_info=True)
-            error_msg = f"Error querying knowledge base: {str(e)}"
-            
-            # Provide specific guidance based on error type
-            if "Expecting value" in str(e):
-                error_msg += "\n\nThis error usually means the knowledge base returned empty or invalid JSON results. Try:\n"
-                error_msg += "1. Check if the database ID is correct using list_knowledge_bases first\n"
-                error_msg += "2. Verify the database exists and contains data\n"
-                error_msg += "3. Try a different search term or query mode (local, global, hybrid, naive, mix)\n"
-                error_msg += "4. Check if the database was properly initialized"
-            elif "not found" in str(e).lower():
-                error_msg += "\n\nDatabase not found. Please call list_knowledge_bases to get available database IDs."
-            elif "empty" in str(e).lower() or "none" in str(e).lower():
-                error_msg += "\n\nQuery returned no results. Try a different search term or check if the database contains data."
-            
             return CallToolResult(
-                content=[TextContent(
-                    type="text",
-                    text=error_msg
-                )],
+                content=[TextContent(type="text", text=f"Error querying knowledge base: {str(e)}")],
                 isError=True
             )
     
@@ -1018,7 +834,7 @@ class KnowledgeBaseServer:
         # 应用多样性策略：避免同类结果过度集中，考虑知识库类型
         if diversity_boost:
             final_results = []
-            max_consecutive_same_type = 2  # 减少连续同类型结果数量
+            max_consecutive_same_type = 1
             max_consecutive_same_kb = 3    # 最多连续3个同知识库结果
             
             for result in all_results:
@@ -1118,7 +934,10 @@ class KnowledgeBaseServer:
                 else:
                     # Default text extraction
                     if isinstance(content, dict):
-                        doc_text = json.dumps(content, ensure_ascii=False)
+                        if "reference_id" in content and "content" in content:
+                            doc_text = content.get("content", "")
+                        else:
+                            doc_text = json.dumps(content, ensure_ascii=False)
                     elif not isinstance(content, str):
                         doc_text = str(content)
                     else:
