@@ -94,7 +94,7 @@ class MCPErrorResponse(BaseModel):
 MCP_TOOLS: List[MCPTool] = [
     MCPTool(
         name="query_knowledge_base",
-        description="Single-DB query; db_id is REQUIRED. One call queries one database only. Call multiple times to query different databases. Use list_knowledge_bases first to get db_id values",
+        description="必须先调用 list_knowledge_bases 获取 db_id；单库查询（db_id 必填），一次仅查询一个知识库；如需查询多个库请多次调用",
         input_schema={
             "type": "object",
             "properties": {
@@ -107,7 +107,7 @@ MCP_TOOLS: List[MCPTool] = [
                 },
                 "db_id": {
                     "type": "string",
-                    "description": "REQUIRED. Specific database ID to query. Use list_knowledge_bases to get available db_id values"
+                    "description": "必填。要查询的知识库 ID（先通过 list_knowledge_bases 获取）"
                 },
                 "mode": {
                     "type": "string", 
@@ -219,7 +219,7 @@ class MCPRequestHandler:
         if not message.method:
             return create_jsonrpc_error_response(
                 ErrorCode.INVALID_REQUEST, 
-                "Missing method field", 
+                "请求缺少 method 字段", 
                 message.id
             )
         
@@ -227,17 +227,17 @@ class MCPRequestHandler:
         if not handler:
             return create_jsonrpc_error_response(
                 ErrorCode.METHOD_NOT_FOUND,
-                f"Method not found: {message.method}",
+                f"未找到方法: {message.method}",
                 message.id
             )
         
         try:
             return await handler(message)
         except Exception as e:
-            logger.error(f"Error in handler {message.method}: {e}", exc_info=True)
+            logger.error(f"处理器错误 {message.method}: {e}", exc_info=True)
             return create_jsonrpc_error_response(
                 ErrorCode.INTERNAL_ERROR,
-                f"Handler error: {str(e)}",
+                f"处理器错误: {str(e)}",
                 message.id
             )
     
@@ -249,7 +249,7 @@ class MCPRequestHandler:
         if protocol_version not in MCPConfig.SUPPORTED_PROTOCOL_VERSIONS:
             return create_jsonrpc_error_response(
                 ErrorCode.INVALID_PARAMS,
-                f"Unsupported protocol version: {protocol_version}. Supported: {MCPConfig.SUPPORTED_PROTOCOL_VERSIONS}",
+                f"不支持的协议版本: {protocol_version}. 支持的版本: {MCPConfig.SUPPORTED_PROTOCOL_VERSIONS}",
                 message.id
             )
         
@@ -263,8 +263,7 @@ class MCPRequestHandler:
                     "prompts": {"listChanged": False},
                     "resources": {
                         "listChanged": False,
-                        "subscribe": False,
-                        "listChanged": False
+                        "subscribe": False
                     }
                 },
                 "serverInfo": {
@@ -299,7 +298,7 @@ class MCPRequestHandler:
         if not tool_name:
             return create_jsonrpc_error_response(
                 ErrorCode.INVALID_PARAMS,
-                "Missing required parameter: name",
+                "缺少必填参数: name",
                 message.id
             )
         
@@ -308,67 +307,47 @@ class MCPRequestHandler:
         if not tool:
             return create_jsonrpc_error_response(
                 ErrorCode.METHOD_NOT_FOUND,
-                f"Unknown tool: {tool_name}",
+                f"未知工具: {tool_name}",
                 message.id
             )
         
         try:
             if tool_name == "query_knowledge_base":
+                if not isinstance(arguments.get("db_id"), str) or not arguments.get("db_id"): 
+                    return create_jsonrpc_error_response(
+                        ErrorCode.INVALID_PARAMS,
+                        "Missing required parameter: db_id (call list_knowledge_bases to get ids)",
+                        message.id
+                    )
                 result = await self.mcp_server._query_knowledge_base(arguments)
             elif tool_name == "list_knowledge_bases":
                 result = await self.mcp_server._list_knowledge_bases()
             else:
                 return create_jsonrpc_error_response(
                     ErrorCode.METHOD_NOT_FOUND,
-                    f"Tool not implemented: {tool_name}",
+                    f"工具未实现: {tool_name}",
                     message.id
                 )
             
             return self._format_tool_result(result, message.id)
             
         except Exception as e:
-            logger.error(f"Tool execution failed {tool_name}: {e}", exc_info=True)
+            logger.error(f"工具执行失败 {tool_name}: {e}", exc_info=True)
             return create_jsonrpc_error_response(
                 ErrorCode.INTERNAL_ERROR,
-                f"Tool execution failed: {str(e)}",
+                f"工具执行失败: {str(e)}",
                 message.id
             )
     
     def _format_tool_result(self, result: Any, request_id: Optional[Any]) -> MCPMessage:
-        """Format tool execution result according to MCP standard"""
         content = []
         is_error = False
-        
-        # Handle CallToolResult from MCP server
         if hasattr(result, 'content') and hasattr(result, 'isError'):
-            # This is a CallToolResult object
             is_error = getattr(result, 'isError', False)
             if result.content:
                 for item in result.content:
                     if hasattr(item, 'text') and hasattr(item, 'type'):
-                        # Try to parse JSON payloads produced by knowledge_base_server for better structure
-                        parsed = None
-                        raw_text = item.text if hasattr(item, 'text') else None
-                        if isinstance(raw_text, str) and raw_text.strip().startswith('{'):
-                            try:
-                                parsed = json.loads(raw_text)
-                            except Exception:
-                                parsed = None
-                        if isinstance(parsed, dict) and 'results' in parsed:
-                            # Expand results into text items that conform to MCP content schema
-                            for r in parsed.get('results', []):
-                                try:
-                                    content.append({"type": "text", "text": json.dumps(r, ensure_ascii=False)})
-                                except Exception:
-                                    content.append({"type": "text", "text": str(r)})
-                            metadata = parsed.get('metadata')
-                            if metadata is not None:
-                                try:
-                                    content.append({"type": "text", "text": json.dumps({"metadata": metadata}, ensure_ascii=False)})
-                                except Exception:
-                                    content.append({"type": "text", "text": f"metadata: {metadata}"})
-                        else:
-                            content.append({"type": item.type, "text": raw_text})
+                        content.append({"type": "text", "text": item.text})
                     elif isinstance(item, dict):
                         try:
                             content.append({"type": "text", "text": json.dumps(item, ensure_ascii=False)})
@@ -377,7 +356,6 @@ class MCPRequestHandler:
                     else:
                         content.append({"type": "text", "text": str(item)})
         elif hasattr(result, 'content') and result.content:
-            # Handle other content formats
             for item in result.content:
                 if hasattr(item, 'text'):
                     content.append({"type": "text", "text": item.text})
@@ -389,30 +367,10 @@ class MCPRequestHandler:
                 else:
                     content.append({"type": "text", "text": str(item)})
         else:
-            # Handle simple results
-            content.append({
-                "type": "text",
-                "text": str(result) if result else "Tool executed successfully"
-            })
-        
-        # If this is an error result, return it as an error response
+            content.append({"type": "text", "text": str(result) if result else "Tool executed successfully"})
         if is_error:
-            return MCPMessage(
-                id=request_id,
-                error={
-                    "code": -32603,
-                    "message": "Tool execution failed",
-                    "data": {"content": content}
-                }
-            )
-        
-        return MCPMessage(
-            id=request_id,
-            result={
-                "content": content,
-                "isError": is_error
-            }
-        )
+            return MCPMessage(id=request_id, error={"code": -32603, "message": "Tool execution failed", "data": {"content": content}})
+        return MCPMessage(id=request_id, result={"content": content, "isError": is_error})
     
     async def _handle_ping(self, message: MCPMessage) -> MCPMessage:
         """Handle ping request"""
@@ -520,7 +478,7 @@ class JSONRPCValidator:
                     "jsonrpc": MCPConfig.PROTOCOL_VERSION,
                     "error": create_error_response(
                         ErrorCode.INVALID_REQUEST,
-                        f"Invalid Request: jsonrpc field must be '{MCPConfig.PROTOCOL_VERSION}'"
+                        f"无效请求: jsonrpc 字段必须为 '{MCPConfig.PROTOCOL_VERSION}'"
                     )
                 }
             )
@@ -536,7 +494,7 @@ class JSONRPCValidator:
                     "jsonrpc": MCPConfig.PROTOCOL_VERSION,
                     "error": create_error_response(
                         ErrorCode.INVALID_REQUEST,
-                        "Invalid Request: Message must be a JSON object"
+                        "无效请求: 消息体必须是 JSON 对象"
                     )
                 }
             )
@@ -549,7 +507,7 @@ class JSONRPCValidator:
             status_code=400,
             content={
                 "jsonrpc": MCPConfig.PROTOCOL_VERSION,
-                "error": create_error_response(ErrorCode.PARSE_ERROR, "Parse error: Invalid JSON")
+                "error": create_error_response(ErrorCode.PARSE_ERROR, "解析错误: 非法 JSON")
             }
         )
 
@@ -563,7 +521,7 @@ class MCPResponseBuilder:
             status_code=503,
             content={
                 "jsonrpc": MCPConfig.PROTOCOL_VERSION,
-                "error": create_error_response(ErrorCode.INTERNAL_ERROR, "MCP server not available")
+                "error": create_error_response(ErrorCode.INTERNAL_ERROR, "MCP 服务不可用")
             }
         )
     
@@ -574,7 +532,7 @@ class MCPResponseBuilder:
             status_code=405,
             content={
                 "jsonrpc": MCPConfig.PROTOCOL_VERSION,
-                "error": create_error_response(ErrorCode.METHOD_NOT_FOUND, "Method not allowed")
+                "error": create_error_response(ErrorCode.METHOD_NOT_FOUND, "不允许的请求方法")
             }
         )
     
@@ -889,7 +847,7 @@ async def get_mcp_info():
     
     return {
         "name": MCPConfig.SERVER_NAME,
-        "description": "Standard MCP server providing access to knowledge base tools",
+        "description": "标准 MCP 服务，提供知识库工具访问能力",
         "protocol": "Model Context Protocol (MCP)",
         "version": "2024-11-05",
         "transport": "Streamable HTTP",
@@ -901,15 +859,15 @@ async def get_mcp_info():
             "version": MCPConfig.SERVER_VERSION
         },
         "usage": {
-            "connection": "Single endpoint at /api/mcp with GET (SSE) and POST (JSON-RPC)",
-            "initialization": "Send initialize JSON-RPC request",
+            "connection": "/api/mcp 单一端点，支持 GET（SSE）与 POST（JSON-RPC）",
+            "initialization": "发送 initialize JSON-RPC 请求进行初始化",
             "tools": {
-                "list": "Use tools/list method",
-                "call": "Use tools/call method with name and arguments. query_knowledge_base REQUIRES db_id and queries ONE database per call; call multiple times to query different databases"
+                "list": "使用 tools/list 获取工具与知识库列表",
+                "call": "调用顺序：先 tools/list 获取 db_id；再 tools/call 执行 query_knowledge_base（db_id 必填，单次仅查询一个库）；如需查询多个库请多次调用"
             },
-            "streaming": "Use GET with Accept: text/event-stream for SSE"
+            "streaming": "GET 携带 Accept: text/event-stream 以启用 SSE"
         },
-        "notes": "Call list_knowledge_bases first to get available db_id values. A single call may not return all desired information; issue multiple calls for different databases as needed",
+        "notes": "调用前必须使用 list_knowledge_bases 获取数据库 ID（db_id）。一次调用不一定获取到完整结果，可按需多次调用不同数据库",
         "tools": tools_info,
         "compliance": {
             "standard": "MCP Specification 2024-11-05",

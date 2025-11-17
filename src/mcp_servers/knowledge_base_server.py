@@ -85,26 +85,26 @@ class KnowledgeBaseServer:
                 # Create a general query tool
                 tools.append(Tool(
                     name="query_knowledge_base",
-                    description="Single-DB query; db_id is REQUIRED. One call queries one database only. Call multiple times to query different databases. Use list_knowledge_bases first to get db_id values.",
+                    description="必须先调用 list_knowledge_bases 获取 db_id；单库查询（db_id 必填），一次仅查询一个知识库；如需查询多个库请多次调用。",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query_text": {
                                 "type": "string",
-                                "description": "The query text to search for. Can be a single string or array of strings for batch queries"
+                                "description": "查询文本（支持单条或批量）"
                             },
                             "db_id": {
                                 "type": "string",
-                                "description": "REQUIRED. Specific database ID to query. Use list_knowledge_bases to get available db_id values"
+                                "description": "必填。要查询的知识库 ID（先通过 list_knowledge_bases 获取）"
                             },
                             "mode": {
                                 "type": "string",
-                                "description": "Query mode",
+                                "description": "查询模式",
                                 "enum": ["local", "global", "hybrid", "naive", "mix"]
                             },
                             "top_k": {
                                 "type": "integer",
-                                "description": "Maximum number of results to return",
+                                "description": "返回数量上限",
                                 "minimum": 1,
                                 "maximum": 100
                             }
@@ -120,22 +120,22 @@ class KnowledgeBaseServer:
                     
                 tools.append(Tool(
                     name=tool_name,
-                    description=f"Query {retriever_info['name']} knowledge base. db_id is embedded in tool name; no db_id argument required. {retriever_info.get('description', '')}",
+                    description=f"查询 {retriever_info['name']} 知识库（工具名已包含 db_id，无需传参）。{retriever_info.get('description', '')}",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query_text": {
                                 "type": "string",
-                                "description": "The query text to search for"
+                                "description": "查询文本"
                             },
                             "mode": {
                                 "type": "string",
-                                "description": "Query mode",
+                                "description": "查询模式",
                                 "enum": ["local", "global", "hybrid", "naive", "mix"]
                             },
                             "top_k": {
                                 "type": "integer",
-                                "description": "Maximum number of results to return",
+                                "description": "返回数量上限",
                                 "minimum": 1,
                                 "maximum": 100
                             }
@@ -221,20 +221,20 @@ class KnowledgeBaseServer:
             if isinstance(query_text_input, list):
                 if len(query_text_input) != 1:
                     return CallToolResult(
-                        content=[TextContent(type="text", text="Error: only one query_text is allowed")],
+                        content=[TextContent(type="text", text="错误：仅允许传入一个 query_text")],
                         isError=True
                     )
                 query_text_input = query_text_input[0]
 
             if not isinstance(query_text_input, str) or not query_text_input.strip():
                 return CallToolResult(
-                    content=[TextContent(type="text", text="Error: query_text is required")],
+                    content=[TextContent(type="text", text="错误：缺少必填参数 query_text")],
                     isError=True
                 )
 
             if not isinstance(db_id, str) or not db_id.strip():
                 return CallToolResult(
-                    content=[TextContent(type="text", text="Error: db_id is required. Call list_knowledge_bases to get available IDs")],
+                    content=[TextContent(type="text", text="错误：缺少必填参数 db_id（请先调用 list_knowledge_bases 获取）")],
                     isError=True
                 )
 
@@ -242,7 +242,7 @@ class KnowledgeBaseServer:
 
             if raw_result is None or raw_result == "":
                 return CallToolResult(
-                    content=[TextContent(type="text", text="No results")],
+                    content=[TextContent(type="text", text="无结果")],
                     isError=True
                 )
 
@@ -255,7 +255,7 @@ class KnowledgeBaseServer:
 
         except Exception as e:
             return CallToolResult(
-                content=[TextContent(type="text", text=f"Error querying knowledge base: {str(e)}")],
+                content=[TextContent(type="text", text=f"查询知识库出错: {str(e)}")],
                 isError=True
             )
     
@@ -1197,12 +1197,12 @@ class KnowledgeBaseServer:
                 }
                 db_list.append(db_info)
             
-            response_text = f"Available Knowledge Bases ({len(db_list)} total):\n\n"
+            response_text = f"可用知识库（共 {len(db_list)} 个）：\n\n"
             for db in db_list:
-                response_text += f"• {db['name']} (ID: {db['id']})\n"
-                response_text += f"  Description: {db['description']}\n"
+                response_text += f"• {db['name']}（ID: {db['id']}）\n"
+                response_text += f"  描述: {db['description']}\n"
                 if db['metadata']:
-                    response_text += f"  Metadata: {json.dumps(db['metadata'], indent=2)}\n"
+                    response_text += f"  元数据: {json.dumps(db['metadata'], ensure_ascii=False, indent=2)}\n"
                 response_text += "\n"
             
             return CallToolResult(
