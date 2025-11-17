@@ -444,48 +444,63 @@ class KnowledgeBaseServer:
             )
     
     def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
-        """Process query result and add metadata"""
+        """Process query result and add metadata with knowledge base type detection"""
         processed_results = []
         
         if result is None or result == "":
             return processed_results
         
+        # Detect knowledge base type from source name or db_id
+        kb_type = self._detect_kb_type(db_id, source_name)
+        
         if isinstance(result, str):
             if result.strip() == "":
                 return processed_results
             else:
-                # Try to parse as JSON
-                try:
-                    parsed_result = json.loads(result)
-                    result = parsed_result
-                except json.JSONDecodeError:
-                    # If not valid JSON, treat as text content
-                    processed_results.append({
-                        "content": result,
-                        "type": "text",
-                        "source_db": db_id,
-                        "source_name": source_name
-                    })
-                    return processed_results
+                # Handle LightRAG knowledge graph output
+                if kb_type == "lightrag" and self._is_knowledge_graph_output(result):
+                    return self._process_lightrag_kg_output(result, db_id, source_name)
+                else:
+                    # Try to parse as JSON
+                    try:
+                        parsed_result = json.loads(result)
+                        result = parsed_result
+                    except json.JSONDecodeError:
+                        # If not valid JSON, treat as text content
+                        processed_results.append({
+                            "content": result,
+                            "type": "text",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": kb_type
+                        })
+                        return processed_results
         
-        # Handle list results
+        # Handle list results (ChromaDB/Milvus vector results)
         if isinstance(result, list):
             for item in result:
                 if isinstance(item, dict):
                     item["source_db"] = db_id
                     item["source_name"] = source_name
+                    item["kb_type"] = kb_type
+                    # Add data type based on content structure
+                    item["data_type"] = self._detect_data_type(item)
                     processed_results.append(item)
                 else:
                     processed_results.append({
                         "content": str(item),
                         "type": "text",
                         "source_db": db_id,
-                        "source_name": source_name
+                        "source_name": source_name,
+                        "kb_type": kb_type,
+                        "data_type": "text"
                     })
         # Handle single dict result
         elif isinstance(result, dict):
             result["source_db"] = db_id
             result["source_name"] = source_name
+            result["kb_type"] = kb_type
+            result["data_type"] = self._detect_data_type(result)
             processed_results.append(result)
         else:
             # Handle other types
@@ -493,7 +508,179 @@ class KnowledgeBaseServer:
                 "content": str(result),
                 "type": "text",
                 "source_db": db_id,
-                "source_name": source_name
+                "source_name": source_name,
+                "kb_type": kb_type,
+                "data_type": "text"
+            })
+        
+        return processed_results
+    
+    def _detect_kb_type(self, db_id: str, source_name: str) -> str:
+        """Detect knowledge base type from db_id or source name"""
+        if "lightrag" in source_name.lower() or "lightrag" in db_id.lower():
+            return "lightrag"
+        elif "chroma" in source_name.lower() or "chroma" in db_id.lower():
+            return "chroma"
+        elif "milvus" in source_name.lower() or "milvus" in db_id.lower():
+            return "milvus"
+        else:
+            return "unknown"
+    
+    def _detect_data_type(self, result: Dict[str, Any]) -> str:
+        """Detect data type based on content structure"""
+        content = result.get("content", {})
+        if isinstance(content, dict):
+            if "entity" in content or "entity1" in content or "entity2" in content:
+                return "knowledge_graph"
+            elif "chunks" in content or "documents" in content:
+                return "vector_result"
+            else:
+                return "structured"
+        elif isinstance(content, str):
+            if self._is_knowledge_graph_output(content):
+                return "knowledge_graph"
+            else:
+                return "text"
+        else:
+            return "unknown"
+    
+    def _is_knowledge_graph_output(self, text: str) -> bool:
+        """Check if text contains knowledge graph data patterns"""
+        kg_patterns = [
+            "entity:", "entities:", "relationship:", "relationships:",
+            "Entity:", "Entities:", "Relationship:", "Relationships:",
+            "知识图谱", "实体", "关系", "[knowledge graph data]"
+        ]
+        text_lower = text.lower()
+        return any(pattern.lower() in text_lower for pattern in kg_patterns)
+    
+    def _process_lightrag_kg_output(self, kg_text: str, db_id: str, source_name: str) -> List[Dict[str, Any]]:
+        """Process LightRAG knowledge graph output into structured results"""
+        processed_results = []
+        
+        # Try to parse as JSON first
+        try:
+            parsed_data = json.loads(kg_text)
+            if isinstance(parsed_data, dict):
+                # Handle structured knowledge graph data
+                entities = parsed_data.get("entities", [])
+                relationships = parsed_data.get("relationships", [])
+                
+                # Process entities
+                for entity in entities:
+                    if isinstance(entity, dict):
+                        processed_results.append({
+                            "content": entity,
+                            "type": "entity",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": "lightrag",
+                            "data_type": "knowledge_graph"
+                        })
+                
+                # Process relationships
+                for rel in relationships:
+                    if isinstance(rel, dict):
+                        processed_results.append({
+                            "content": rel,
+                            "type": "relationship",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": "lightrag",
+                            "data_type": "knowledge_graph"
+                        })
+                
+                return processed_results
+        except json.JSONDecodeError:
+            pass
+        
+        # Fallback: parse as formatted text
+        lines = kg_text.strip().split('\n')
+        current_section = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Detect section headers
+            if any(header in line.lower() for header in ["entity", "实体"]):
+                current_section = "entity"
+                continue
+            elif any(header in line.lower() for header in ["relationship", "关系"]):
+                current_section = "relationship"
+                continue
+            
+            # Parse entity/relationship content
+            if current_section and (":" in line or "->" in line):
+                if current_section == "entity":
+                    # Parse entity format: "Name: Type - Description"
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        entity_name = parts[0].strip()
+                        entity_info = parts[1].strip()
+                        
+                        # Extract type and description
+                        if " - " in entity_info:
+                            type_desc = entity_info.split(" - ", 1)
+                            entity_type = type_desc[0].strip()
+                            description = type_desc[1].strip() if len(type_desc) > 1 else ""
+                        else:
+                            entity_type = "Unknown"
+                            description = entity_info
+                        
+                        processed_results.append({
+                            "content": {
+                                "entity": entity_name,
+                                "type": entity_type,
+                                "description": description
+                            },
+                            "type": "entity",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": "lightrag",
+                            "data_type": "knowledge_graph"
+                        })
+                
+                elif current_section == "relationship":
+                    # Parse relationship format: "Entity1 -> Entity2: Description"
+                    if "->" in line:
+                        parts = line.split("->", 1)
+                        if len(parts) == 2:
+                            entity1 = parts[0].strip()
+                            remaining = parts[1].strip()
+                            
+                            # Extract entity2 and description
+                            if ":" in remaining:
+                                entity2_desc = remaining.split(":", 1)
+                                entity2 = entity2_desc[0].strip()
+                                description = entity2_desc[1].strip() if len(entity2_desc) > 1 else ""
+                            else:
+                                entity2 = remaining
+                                description = ""
+                            
+                            processed_results.append({
+                                "content": {
+                                    "entity1": entity1,
+                                    "entity2": entity2,
+                                    "description": description
+                                },
+                                "type": "relationship",
+                                "source_db": db_id,
+                                "source_name": source_name,
+                                "kb_type": "lightrag",
+                                "data_type": "knowledge_graph"
+                            })
+        
+        # If no structured data was found, treat as plain text
+        if not processed_results:
+            processed_results.append({
+                "content": kg_text,
+                "type": "text",
+                "source_db": db_id,
+                "source_name": source_name,
+                "kb_type": "lightrag",
+                "data_type": "text"
             })
         
         return processed_results
@@ -571,20 +758,32 @@ class KnowledgeBaseServer:
     def _merge_mixed_results(self, text_results: List[Dict[str, Any]], kg_results: List[Dict[str, Any]], 
                            query_texts: List[str] = None, kg_weight: float = None, 
                            diversity_boost: bool = True) -> List[Dict[str, Any]]:
-        """Merge and balance text and knowledge graph results"""
-        # 确保两类结果都有合理的分数分布
+        """Merge and balance text and knowledge graph results with knowledge base type awareness"""
+        
+        # Enhanced score normalization that considers knowledge base type
         def normalize_scores(results: List[Dict[str, Any]], score_key: str = "relevance_score") -> List[Dict[str, Any]]:
             if not results:
                 return results
             
             scores = [r.get(score_key, 0) for r in results]
             if not scores or max(scores) == min(scores):
-                # 如果没有分数或分数相同，赋予默认分数
+                # 如果没有分数或分数相同，赋予默认分数（考虑知识库类型）
                 for i, result in enumerate(results):
-                    result[score_key] = 0.5 + (i * 0.1)  # 简单的递减分数
+                    kb_type = result.get("kb_type", "unknown")
+                    # Different base scores for different KB types
+                    if kb_type == "chroma":
+                        base_score = 0.6
+                    elif kb_type == "milvus":
+                        base_score = 0.65
+                    elif kb_type == "lightrag":
+                        base_score = 0.7  # Knowledge graph gets slightly higher base
+                    else:
+                        base_score = 0.5
+                    
+                    result[score_key] = base_score + (i * 0.05)  # 简单的递减分数
                 return results
             
-            # 归一化到0-1范围
+            # 归一化到0-1范围，考虑知识库类型权重
             min_score = min(scores)
             max_score = max(scores)
             score_range = max_score - min_score if max_score != min_score else 1
@@ -592,7 +791,15 @@ class KnowledgeBaseServer:
             for result in results:
                 original_score = result.get(score_key, 0)
                 normalized_score = (original_score - min_score) / score_range
-                result[score_key] = max(0.1, normalized_score)  # 确保最小分数不为0
+                
+                # Apply knowledge base type boost
+                kb_type = result.get("kb_type", "unknown")
+                if kb_type == "lightrag":
+                    normalized_score *= 1.1  # Slight boost for knowledge graph data
+                elif kb_type == "milvus":
+                    normalized_score *= 1.05  # Small boost for Milvus
+                
+                result[score_key] = max(0.1, min(1.0, normalized_score))  # 确保在合理范围内
             
             return results
         
@@ -602,20 +809,32 @@ class KnowledgeBaseServer:
         
         # 为知识图谱结果添加额外的专业分数权重
         if kg_weight is None:
-            # 自动计算权重
+            # 自动计算权重，考虑查询意图和知识库类型
             for result in kg_results:
                 content = result.get("content", {})
+                kb_type = result.get("kb_type", "unknown")
                 if isinstance(content, dict):
                     original_query = result.get("original_query", "")
+                    
+                    # Base KG weight calculation
                     if "entity" in content:
                         entity_score = self._score_entity_relevance(content, original_query)
-                        # 实体结果给予额外权重，考虑查询意图
                         auto_kg_weight = self._calculate_kg_weight(query_texts, content, "entity")
+                        
+                        # Adjust weight based on knowledge base type
+                        if kb_type == "lightrag":
+                            auto_kg_weight *= 1.2  # Boost for LightRAG entities
+                        
                         result["relevance_score"] = result.get("relevance_score", 0) * (1 - auto_kg_weight) + entity_score * auto_kg_weight
+                        
                     elif "entity1" in content:
                         rel_score = self._score_relationship_relevance(content, original_query)
-                        # 关系结果给予额外权重，考虑查询意图
                         auto_kg_weight = self._calculate_kg_weight(query_texts, content, "relationship")
+                        
+                        # Adjust weight based on knowledge base type
+                        if kb_type == "lightrag":
+                            auto_kg_weight *= 1.15  # Boost for LightRAG relationships
+                        
                         result["relevance_score"] = result.get("relevance_score", 0) * (1 - auto_kg_weight) + rel_score * auto_kg_weight
         else:
             # 使用用户指定的权重
@@ -636,13 +855,15 @@ class KnowledgeBaseServer:
         # 按分数排序
         all_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
         
-        # 应用多样性策略：避免同类结果过度集中
+        # 应用多样性策略：避免同类结果过度集中，考虑知识库类型
         if diversity_boost:
             final_results = []
-            max_consecutive_same_type = 3  # 最多连续3个同类型结果
+            max_consecutive_same_type = 2  # 减少连续同类型结果数量
+            max_consecutive_same_kb = 3    # 最多连续3个同知识库结果
             
             for result in all_results:
                 data_type = result.get("data_type", "text")
+                kb_type = result.get("kb_type", "unknown")
                 
                 # 检查是否需要强制插入不同类型结果以保持多样性
                 if len(final_results) >= max_consecutive_same_type:
@@ -658,7 +879,21 @@ class KnowledgeBaseServer:
                             best_opposite = max(opposite_candidates, key=lambda x: x.get("relevance_score", 0))
                             final_results.append(best_opposite)
                             all_results.remove(best_opposite)
-                            # 继续处理当前结果
+                
+                # 检查知识库类型多样性
+                if len(final_results) >= max_consecutive_same_kb:
+                    last_kb_types = [r.get("kb_type", "unknown") for r in final_results[-max_consecutive_same_kb:]]
+                    if len(set(last_kb_types)) == 1:  # 最近都是同知识库
+                        # 寻找不同知识库的高分结果
+                        current_kb_type = kb_type
+                        different_kb_candidates = [r for r in all_results[len(final_results):] 
+                                                 if r.get("kb_type", "unknown") != current_kb_type]
+                        
+                        if different_kb_candidates:
+                            # 插入一个不同知识库的最佳结果
+                            best_different_kb = max(different_kb_candidates, key=lambda x: x.get("relevance_score", 0))
+                            final_results.append(best_different_kb)
+                            all_results.remove(best_different_kb)
                 
                 final_results.append(result)
                 
@@ -676,12 +911,18 @@ class KnowledgeBaseServer:
             else:
                 result["data_type"] = "text"
         
-        logger.info(f"Merged {len(text_results)} text results and {len(kg_results)} KG results")
+        # 添加统计信息
+        kb_type_stats = {}
+        for result in all_results:
+            kb_type = result.get("kb_type", "unknown")
+            kb_type_stats[kb_type] = kb_type_stats.get(kb_type, 0) + 1
+        
+        logger.info(f"Merged {len(text_results)} text results and {len(kg_results)} KG results. KB types: {kb_type_stats}")
         
         return all_results
     
     async def _rerank_text_results(self, results: List[Dict[str, Any]], rerank_model: str) -> List[Dict[str, Any]]:
-        """Apply standard text reranking to results"""
+        """Apply specialized text reranking to results based on knowledge base type"""
         try:
             from src.models.rerank import get_reranker
             reranker = get_reranker(rerank_model)
@@ -691,13 +932,39 @@ class KnowledgeBaseServer:
             for result in results:
                 query = result.get("original_query", "")
                 content = result.get("content", "")
+                kb_type = result.get("kb_type", "unknown")
                 
-                if isinstance(content, dict):
-                    content = json.dumps(content, ensure_ascii=False)
-                elif not isinstance(content, str):
-                    content = str(content)
+                # Extract text content based on knowledge base type
+                if kb_type == "chroma":
+                    # ChromaDB returns chunks with content and metadata
+                    if isinstance(content, dict):
+                        doc_text = content.get("content", "")
+                        metadata = content.get("metadata", {})
+                        # Include metadata context for better reranking
+                        if metadata:
+                            doc_text = f"{doc_text}\n[Metadata: {json.dumps(metadata, ensure_ascii=False)}]"
+                    else:
+                        doc_text = str(content)
+                elif kb_type == "milvus":
+                    # Milvus returns structured content with metadata
+                    if isinstance(content, dict):
+                        doc_text = content.get("content", "")
+                        metadata = content.get("metadata", {})
+                        # Include source and other metadata
+                        if metadata.get("source"):
+                            doc_text = f"Source: {metadata['source']}\n{doc_text}"
+                    else:
+                        doc_text = str(content)
+                else:
+                    # Default text extraction
+                    if isinstance(content, dict):
+                        doc_text = json.dumps(content, ensure_ascii=False)
+                    elif not isinstance(content, str):
+                        doc_text = str(content)
+                    else:
+                        doc_text = content
                 
-                rerank_pairs.append([query, content])
+                rerank_pairs.append([query, doc_text])
             
             # Get relevance scores
             if rerank_pairs:
@@ -706,11 +973,24 @@ class KnowledgeBaseServer:
                 # Add scores to results and sort by relevance
                 for idx, (result, score) in enumerate(zip(results, scores)):
                     result["relevance_score"] = score
+                    
+                    # Preserve original scores for different knowledge base types
+                    kb_type = result.get("kb_type", "unknown")
+                    if kb_type == "chroma":
+                        # Preserve original ChromaDB similarity score
+                        if isinstance(result.get("content"), dict):
+                            original_score = result["content"].get("score", 0.0)
+                            result["original_chroma_score"] = original_score
+                    elif kb_type == "milvus":
+                        # Preserve original Milvus score
+                        if isinstance(result.get("content"), dict):
+                            original_score = result["content"].get("score", 0.0)
+                            result["original_milvus_score"] = original_score
                 
                 # Sort by relevance score (descending)
                 results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
                 
-                logger.info(f"Reranked {len(results)} text results with model {rerank_model}")
+                logger.info(f"Reranked {len(results)} text results with model {rerank_model} (KB types: {set(r.get('kb_type', 'unknown') for r in results)})")
             
             return results
             
@@ -719,7 +999,7 @@ class KnowledgeBaseServer:
             return results
     
     async def _rerank_knowledge_graph_results(self, results: List[Dict[str, Any]], rerank_model: str) -> List[Dict[str, Any]]:
-        """Apply knowledge graph specific reranking to results"""
+        """Apply knowledge graph specific reranking to results with LightRAG optimization"""
         try:
             from src.models.rerank import get_reranker
             reranker = get_reranker(rerank_model)
@@ -733,11 +1013,29 @@ class KnowledgeBaseServer:
                 if isinstance(content, dict):
                     # Check if this is knowledge graph data
                     if "entity" in content:
-                        # Entity data
-                        content = f"Entity: {content.get('entity', '')} ({content.get('type', '')}) - {content.get('description', '')}"
-                    elif "entity1" in content:
-                        # Relationship data
-                        content = f"Relationship: {content.get('entity1', '')} -> {content.get('entity2', '')} - {content.get('description', '')}"
+                        # Entity data - enhanced format for LightRAG
+                        entity_name = content.get('entity', '')
+                        entity_type = content.get('type', '')
+                        description = content.get('description', '')
+                        
+                        # Create comprehensive entity description for reranking
+                        content = f"Entity: {entity_name}"
+                        if entity_type:
+                            content += f" (Type: {entity_type})"
+                        if description:
+                            content += f" - {description}"
+                            
+                    elif "entity1" in content and "entity2" in content:
+                        # Relationship data - enhanced format for LightRAG
+                        entity1 = content.get('entity1', '')
+                        entity2 = content.get('entity2', '')
+                        description = content.get('description', '')
+                        
+                        # Create comprehensive relationship description
+                        content = f"Relationship: {entity1} -> {entity2}"
+                        if description:
+                            content += f" - {description}"
+                            
                     else:
                         # Regular dict data
                         content = json.dumps(content, ensure_ascii=False)
@@ -762,13 +1060,22 @@ class KnowledgeBaseServer:
                             # Entity data - add specialized entity relevance score
                             entity_score = self._score_entity_relevance(content, original_query)
                             result["entity_relevance_score"] = entity_score
-                        elif "entity1" in content:
+                            
+                            # Combine rerank score with entity score for final ranking
+                            combined_score = score * 0.7 + entity_score * 0.3
+                            result["combined_relevance_score"] = combined_score
+                            
+                        elif "entity1" in content and "entity2" in content:
                             # Relationship data - add specialized relationship relevance score
                             rel_score = self._score_relationship_relevance(content, original_query)
                             result["relationship_relevance_score"] = rel_score
+                            
+                            # Combine rerank score with relationship score
+                            combined_score = score * 0.6 + rel_score * 0.4
+                            result["combined_relevance_score"] = combined_score
                 
-                # Sort by relevance score (descending)
-                results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                # Sort by combined relevance score if available, otherwise by rerank score
+                results.sort(key=lambda x: x.get("combined_relevance_score", x.get("relevance_score", 0)), reverse=True)
                 
                 logger.info(f"Reranked {len(results)} knowledge graph results with model {rerank_model}")
             
@@ -797,48 +1104,63 @@ class KnowledgeBaseServer:
         return score
     
     def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
-        """Process query result and add metadata"""
+        """Process query result and add metadata with knowledge base type detection"""
         processed_results = []
         
         if result is None or result == "":
             return processed_results
         
+        # Detect knowledge base type from source name or db_id
+        kb_type = self._detect_kb_type(db_id, source_name)
+        
         if isinstance(result, str):
             if result.strip() == "":
                 return processed_results
             else:
-                # Try to parse as JSON
-                try:
-                    parsed_result = json.loads(result)
-                    result = parsed_result
-                except json.JSONDecodeError:
-                    # If not valid JSON, treat as text content
-                    processed_results.append({
-                        "content": result,
-                        "type": "text",
-                        "source_db": db_id,
-                        "source_name": source_name
-                    })
-                    return processed_results
+                # Handle LightRAG knowledge graph output
+                if kb_type == "lightrag" and self._is_knowledge_graph_output(result):
+                    return self._process_lightrag_kg_output(result, db_id, source_name)
+                else:
+                    # Try to parse as JSON
+                    try:
+                        parsed_result = json.loads(result)
+                        result = parsed_result
+                    except json.JSONDecodeError:
+                        # If not valid JSON, treat as text content
+                        processed_results.append({
+                            "content": result,
+                            "type": "text",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": kb_type
+                        })
+                        return processed_results
         
-        # Handle list results
+        # Handle list results (ChromaDB/Milvus vector results)
         if isinstance(result, list):
             for item in result:
                 if isinstance(item, dict):
                     item["source_db"] = db_id
                     item["source_name"] = source_name
+                    item["kb_type"] = kb_type
+                    # Add data type based on content structure
+                    item["data_type"] = self._detect_data_type(item)
                     processed_results.append(item)
                 else:
                     processed_results.append({
                         "content": str(item),
                         "type": "text",
                         "source_db": db_id,
-                        "source_name": source_name
+                        "source_name": source_name,
+                        "kb_type": kb_type,
+                        "data_type": "text"
                     })
         # Handle single dict result
         elif isinstance(result, dict):
             result["source_db"] = db_id
             result["source_name"] = source_name
+            result["kb_type"] = kb_type
+            result["data_type"] = self._detect_data_type(result)
             processed_results.append(result)
         else:
             # Handle other types
@@ -846,7 +1168,9 @@ class KnowledgeBaseServer:
                 "content": str(result),
                 "type": "text",
                 "source_db": db_id,
-                "source_name": source_name
+                "source_name": source_name,
+                "kb_type": kb_type,
+                "data_type": "text"
             })
         
         return processed_results
