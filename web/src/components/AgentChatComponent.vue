@@ -43,6 +43,22 @@
           </div>
         </div>
         <div class="header__right">
+          <!-- AgentState 显示按钮 - 只在智能体支持 todo 或 files 能力时显示 -->
+          <AgentPopover
+            v-if="hasAgentStateContent"
+            v-model:visible="agentStatePopoverVisible"
+            :agent-state="currentAgentState"
+            @refresh="handleAgentStateRefresh"
+          >
+            <div
+              class="agent-nav-btn agent-state-btn"
+              :class="{ 'has-content': hasAgentStateContent }"
+              :title="hasAgentStateContent ? '查看工作状态' : '暂无工作状态'"
+            >
+              <Activity class="nav-btn-icon" size="18"/>
+              <span v-if="hasAgentStateContent" class="text">{{ totalAgentStateItems }}</span>
+            </div>
+          </AgentPopover>
           <!-- <div class="nav-btn" @click="shareChat" v-if="currentChatId && currentAgent">
             <ShareAltOutlined style="font-size: 18px;"/>
           </div> -->
@@ -202,7 +218,8 @@
         </div>
       </div>
     </div>
-  </div>
+
+    </div>
 </template>
 
 <script setup>
@@ -217,7 +234,7 @@ import AgentMessageComponent from '@/components/AgentMessageComponent.vue'
 import ImagePreviewComponent from '@/components/ImagePreviewComponent.vue'
 import ChatSidebarComponent from '@/components/ChatSidebarComponent.vue'
 import RefsComponent from '@/components/RefsComponent.vue'
-import { PanelLeftOpen, MessageCirclePlus, LoaderCircle } from 'lucide-vue-next';
+import { PanelLeftOpen, MessageCirclePlus, LoaderCircle, Activity } from 'lucide-vue-next';
 import { handleChatError, handleValidationError } from '@/utils/errorHandler';
 import { ScrollController } from '@/utils/scrollController';
 import { AgentValidator } from '@/utils/agentValidator';
@@ -228,6 +245,7 @@ import { MessageProcessor } from '@/utils/messageProcessor';
 import { agentApi, threadApi } from '@/apis';
 import HumanApprovalModal from '@/components/HumanApprovalModal.vue';
 import { useApproval } from '@/composables/useApproval';
+import AgentPopover from '@/components/AgentPopover.vue';
 
 // ==================== PROPS & EMITS ====================
 const props = defineProps({
@@ -293,6 +311,9 @@ const attachmentState = reactive({
   isUploading: false,
 })
 
+// AgentState Popover 状态
+const agentStatePopoverVisible = ref(false);
+
 // ==================== COMPUTED PROPERTIES ====================
 const currentAgentId = computed(() => {
   if (props.singleMode) {
@@ -332,6 +353,47 @@ const supportsFileUpload = computed(() => {
   if (!currentAgent.value) return false;
   const capabilities = currentAgent.value.capabilities || [];
   return capabilities.includes('file_upload');
+});
+const supportsTodo = computed(() => {
+  if (!currentAgent.value) return false;
+  const capabilities = currentAgent.value.capabilities || [];
+  return capabilities.includes('todo');
+});
+
+const supportsFiles = computed(() => {
+  if (!currentAgent.value) return false;
+  const capabilities = currentAgent.value.capabilities || [];
+  return capabilities.includes('files');
+});
+
+// AgentState 相关计算属性
+const currentAgentState = computed(() => {
+  return currentChatId.value ? getThreadState(currentChatId.value)?.agentState || null : null;
+});
+
+const countFiles = (files) => {
+  if (!Array.isArray(files)) return 0;
+  let c = 0;
+  for (const item of files) {
+    if (item && typeof item === 'object') c += Object.keys(item).length;
+  }
+  return c;
+};
+
+const hasAgentStateContent = computed(() => {
+  const s = currentAgentState.value;
+  if (!s) return false;
+  const todoCount = Array.isArray(s.todos) ? s.todos.length : 0;
+  const fileCount = countFiles(s.files);
+  return todoCount > 0 || fileCount > 0;
+});
+
+const totalAgentStateItems = computed(() => {
+  const s = currentAgentState.value;
+  if (!s) return 0;
+  const todoCount = Array.isArray(s.todos) ? s.todos.length : 0;
+  const fileCount = countFiles(s.files);
+  return todoCount + fileCount;
 });
 
 const currentThreadMessages = computed(() => threadMessages.value[currentChatId.value] || []);
@@ -427,7 +489,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (resizeObserver) resizeObserver.disconnect();
   scrollController.cleanup();
-  // 清理所有线程状态
+    // 清理所有线程状态
   resetOnGoingConv();
 });
 
@@ -439,7 +501,8 @@ const getThreadState = (threadId) => {
     chatState.threadStates[threadId] = {
       isStreaming: false,
       streamAbortController: null,
-      onGoingConv: createOnGoingConvState()
+      onGoingConv: createOnGoingConvState(),
+      agentState: null  // 添加 agentState 字段
     };
   }
   return chatState.threadStates[threadId];
@@ -548,10 +611,27 @@ const _processStreamChunk = (chunk, threadId) => {
     case 'human_approval_required':
       // 使用审批 composable 处理审批请求
       return processApprovalInStream(chunk, threadId, currentAgentId.value);
+    case 'agent_state':
+      if ((supportsTodo.value || supportsFiles.value) && chunk.agent_state) {
+        console.log('[AgentState]', {
+          threadId,
+          todos: chunk.agent_state?.todos || [],
+          files: chunk.agent_state?.files || []
+        });
+        threadState.agentState = chunk.agent_state;
+      }
+      return false;
     case 'finished':
       // 先标记流式结束，但保持消息显示直到历史记录加载完成
       if (threadState) {
         threadState.isStreaming = false;
+        if ((supportsTodo.value || supportsFiles.value) && threadState.agentState) {
+          console.log('[AgentState|Final]', {
+            threadId,
+            todos: threadState.agentState?.todos || [],
+            files: threadState.agentState?.files || []
+          });
+        }
       }
       // 异步加载历史记录，保持当前消息显示直到历史记录加载完成
       fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId })
@@ -686,6 +766,15 @@ const fetchThreadMessages = async ({ agentId, threadId, delay = 0 }) => {
     handleChatError(error, 'load');
     throw error;
   }
+};
+
+const fetchAgentState = async (agentId, threadId) => {
+  if (!agentId || !threadId) return;
+  try {
+    const res = await agentApi.getAgentState(agentId, threadId);
+    const ts = getThreadState(threadId);
+    if (ts) ts.agentState = res.agent_state || null;
+  } catch (error) {}
 };
 
 const loadThreadAttachments = async (threadId, { silent = false } = {}) => {
@@ -886,6 +975,7 @@ const selectChat = async (chatId) => {
   try {
     await fetchThreadMessages({ agentId: currentAgentId.value, threadId: chatId });
     await loadThreadAttachments(chatId, { silent: true });
+    await fetchAgentState(currentAgentId.value, chatId);
   } catch (error) {
     handleChatError(error, 'load');
   } finally {
@@ -1172,6 +1262,11 @@ const toggleSidebar = () => {
 };
 const openAgentModal = () => emit('open-agent-modal');
 
+const handleAgentStateRefresh = async () => {
+  if (!currentAgentId.value || !currentChatId.value) return;
+  await fetchAgentState(currentAgentId.value, currentChatId.value);
+};
+
 // ==================== HELPER FUNCTIONS ====================
 const getLastMessage = (conv) => {
   if (!conv?.messages?.length) return null;
@@ -1231,6 +1326,7 @@ const loadChatsList = async () => {
   }
 };
 
+
 const initAll = async () => {
   try {
     if (!agentStore.isInitialized) {
@@ -1244,7 +1340,7 @@ const initAll = async () => {
 onMounted(async () => {
   await initAll();
   scrollController.enableAutoScroll();
-});
+  });
 
 watch(currentAgentId, async (newAgentId, oldAgentId) => {
   if (newAgentId !== oldAgentId) {
@@ -1766,6 +1862,16 @@ watch(conversations, () => {
 
   .loading-icon {
     animation: spin 1s linear infinite;
+  }
+}
+
+/* AgentState 按钮有内容时的样式 */
+.agent-nav-btn.agent-state-btn.has-content {
+  color: var(--main-600);
+
+  &:hover:not(.is-disabled) {
+    color: var(--main-700);
+    background-color: var(--main-40);
   }
 }
 
