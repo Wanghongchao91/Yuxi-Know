@@ -694,19 +694,43 @@ class KnowledgeBaseServer:
             
             # Parse document chunks
             elif current_section == "chunks":
-                if line.startswith('{"reference_id"'):
-                    try:
-                        parsed_obj = json.loads(line)
-                        processed_results.append({
-                            "content": parsed_obj,
-                            "type": "chunk",
-                            "source_db": db_id,
-                            "source_name": source_name,
-                            "kb_type": "lightrag",
-                            "data_type": "document_chunk"
-                        })
-                    except json.JSONDecodeError:
+                # Robust JSON capture for chunk entries (single-line or multi-line)
+                if line.startswith('{'):
+                    # Try single-line first
+                    if line.endswith('}'):
+                        try:
+                            parsed_obj = json.loads(line)
+                            processed_results.append({
+                                "content": parsed_obj,
+                                "type": "chunk",
+                                "source_db": db_id,
+                                "source_name": source_name,
+                                "kb_type": "lightrag",
+                                "data_type": "document_chunk"
+                            })
+                        except json.JSONDecodeError:
+                            pass
                         continue
+                    # Start buffering multi-line JSON
+                    in_json = True
+                    json_buffer = line
+                elif in_json:
+                    json_buffer += line
+                    if line.endswith('}'):
+                        try:
+                            parsed_obj = json.loads(json_buffer)
+                            processed_results.append({
+                                "content": parsed_obj,
+                                "type": "chunk",
+                                "source_db": db_id,
+                                "source_name": source_name,
+                                "kb_type": "lightrag",
+                                "data_type": "document_chunk"
+                            })
+                            json_buffer = ""
+                            in_json = False
+                        except json.JSONDecodeError:
+                            continue
         
         # If we found parsed results, return them
         if processed_results:
@@ -753,6 +777,7 @@ class KnowledgeBaseServer:
                                 "type": entity_type,
                                 "description": description
                             },
+                            "rendered_text": f"Entity: {entity_name}" + (f" (Type: {entity_type})" if entity_type else "") + (f" - {description}" if description else ""),
                             "type": "entity",
                             "source_db": db_id,
                             "source_name": source_name,
@@ -783,6 +808,7 @@ class KnowledgeBaseServer:
                                     "entity2": entity2,
                                     "description": description
                                 },
+                                "rendered_text": f"Relationship: {entity1} -> {entity2}" + (f" - {description}" if description else ""),
                                 "type": "relationship",
                                 "source_db": db_id,
                                 "source_name": source_name,
