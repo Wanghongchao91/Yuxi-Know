@@ -359,15 +359,18 @@ class MCPRequestHandler:
                             except Exception:
                                 parsed = None
                         if isinstance(parsed, dict) and 'results' in parsed:
-                            # Expand results array into individual content entries and include metadata
+                            # Expand results into text items that conform to MCP content schema
                             for r in parsed.get('results', []):
-                                if isinstance(r, dict):
-                                    content.append(r)
-                                else:
+                                try:
+                                    content.append({"type": "text", "text": json.dumps(r, ensure_ascii=False)})
+                                except Exception:
                                     content.append({"type": "text", "text": str(r)})
                             metadata = parsed.get('metadata')
                             if metadata is not None:
-                                content.append({"type": "metadata", "metadata": metadata})
+                                try:
+                                    content.append({"type": "text", "text": json.dumps({"metadata": metadata}, ensure_ascii=False)})
+                                except Exception:
+                                    content.append({"type": "text", "text": f"metadata: {metadata}"})
                         else:
                             content.append({"type": item.type, "text": raw_text})
                     elif isinstance(item, dict):
