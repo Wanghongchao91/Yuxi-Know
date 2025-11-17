@@ -350,8 +350,26 @@ class MCPRequestHandler:
             if result.content:
                 for item in result.content:
                     if hasattr(item, 'text') and hasattr(item, 'type'):
-                        # This is likely a TextContent or similar MCP content object
-                        content.append({"type": item.type, "text": item.text})
+                        # Try to parse JSON payloads produced by knowledge_base_server for better structure
+                        parsed = None
+                        raw_text = item.text if hasattr(item, 'text') else None
+                        if isinstance(raw_text, str) and raw_text.strip().startswith('{'):
+                            try:
+                                parsed = json.loads(raw_text)
+                            except Exception:
+                                parsed = None
+                        if isinstance(parsed, dict) and 'results' in parsed:
+                            # Expand results array into individual content entries and include metadata
+                            for r in parsed.get('results', []):
+                                if isinstance(r, dict):
+                                    content.append(r)
+                                else:
+                                    content.append({"type": "text", "text": str(r)})
+                            metadata = parsed.get('metadata')
+                            if metadata is not None:
+                                content.append({"type": "metadata", "metadata": metadata})
+                        else:
+                            content.append({"type": item.type, "text": raw_text})
                     elif isinstance(item, dict):
                         content.append(item)
                     else:

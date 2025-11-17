@@ -623,6 +623,31 @@ class KnowledgeBaseServer:
             if current_section in ["entity", "relationship"]:
                 # Check if this line starts a JSON object
                 if line.startswith('{"'):
+                    # single-line JSON object
+                    if line.endswith('}'):
+                        try:
+                            parsed_obj = json.loads(line)
+                            if current_section == "entity" and "entity" in parsed_obj:
+                                processed_results.append({
+                                    "content": parsed_obj,
+                                    "type": "entity",
+                                    "source_db": db_id,
+                                    "source_name": source_name,
+                                    "kb_type": "lightrag",
+                                    "data_type": "knowledge_graph"
+                                })
+                            elif current_section == "relationship" and ("entity1" in parsed_obj or "entity2" in parsed_obj):
+                                processed_results.append({
+                                    "content": parsed_obj,
+                                    "type": "relationship",
+                                    "source_db": db_id,
+                                    "source_name": source_name,
+                                    "kb_type": "lightrag",
+                                    "data_type": "knowledge_graph"
+                                })
+                        except json.JSONDecodeError:
+                            pass
+                        continue
                     in_json = True
                     json_buffer = line
                 elif in_json:
