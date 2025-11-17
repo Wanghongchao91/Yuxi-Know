@@ -53,6 +53,15 @@ class KnowledgeQueryModel(BaseModel):
     top_k: Optional[int] = Field(default=10, description="Maximum number of results to return")
 
 
+class RerankConfig:
+    """Internal configuration for reranking parameters"""
+    DEFAULT_ENABLE_RERANK = True
+    DEFAULT_RERANK_MODEL = "bge-reranker-v2-m3"
+    DEFAULT_RERANK_STRATEGY = "auto"
+    DEFAULT_KG_WEIGHT = None  # Auto calculate
+    DEFAULT_DIVERSITY_BOOST = True
+
+
 class KnowledgeBaseServer:
     """MCP Server for Knowledge Base operations"""
     
@@ -76,29 +85,26 @@ class KnowledgeBaseServer:
                 # Create a general query tool
                 tools.append(Tool(
                     name="query_knowledge_base",
-                    description="Query all available knowledge bases with intelligent routing",
+                    description="Query all available knowledge bases with intelligent routing and automatic reranking. Results are automatically optimized for relevance using advanced reranking algorithms.",
                     inputSchema={
                         "type": "object",
                         "properties": {
                             "query_text": {
                                 "type": "string",
-                                "description": "The query text to search for"
+                                "description": "The query text to search for. Can be a single string or array of strings for batch queries"
                             },
                             "db_id": {
                                 "type": "string",
-                                "description": "Specific database ID to query (optional)",
-                                "default": None
+                                "description": "Specific database ID to query (optional). Use list_knowledge_bases to get available db_id values"
                             },
                             "mode": {
                                 "type": "string",
                                 "description": "Query mode",
-                                "enum": ["local", "global", "hybrid", "naive", "mix"],
-                                "default": "mix"
+                                "enum": ["local", "global", "hybrid", "naive", "mix"]
                             },
                             "top_k": {
                                 "type": "integer",
                                 "description": "Maximum number of results to return",
-                                "default": 10,
                                 "minimum": 1,
                                 "maximum": 100
                             }
@@ -125,13 +131,11 @@ class KnowledgeBaseServer:
                                 "mode": {
                                     "type": "string",
                                     "description": "Query mode",
-                                    "enum": ["local", "global", "hybrid", "naive", "mix"],
-                                    "default": "mix"
+                                    "enum": ["local", "global", "hybrid", "naive", "mix"]
                                 },
                                 "top_k": {
                                     "type": "integer",
                                     "description": "Maximum number of results to return",
-                                    "default": 10,
                                     "minimum": 1,
                                     "maximum": 100
                                 }
@@ -214,8 +218,12 @@ class KnowledgeBaseServer:
             db_id_input = arguments.get("db_id")
             mode = arguments.get("mode", "mix")
             top_k = arguments.get("top_k", 10)
-            enable_rerank = arguments.get("enable_rerank", True)
-            rerank_model = arguments.get("rerank_model", "bge-reranker-v2-m3")
+            # 使用内部默认配置，用户不需要看到这些参数
+            enable_rerank = arguments.get("enable_rerank", RerankConfig.DEFAULT_ENABLE_RERANK)
+            rerank_model = arguments.get("rerank_model", RerankConfig.DEFAULT_RERANK_MODEL)
+            rerank_strategy = arguments.get("rerank_strategy", RerankConfig.DEFAULT_RERANK_STRATEGY)
+            kg_weight = arguments.get("kg_weight", RerankConfig.DEFAULT_KG_WEIGHT)
+            diversity_boost = arguments.get("diversity_boost", RerankConfig.DEFAULT_DIVERSITY_BOOST)
             
             # Normalize query texts to list
             if isinstance(query_text_input, str):
@@ -256,7 +264,8 @@ class KnowledgeBaseServer:
                 "total_queries": len(query_texts),
                 "databases_queried": [],
                 "rerank_enabled": enable_rerank,
-                "rerank_model": rerank_model if enable_rerank else None
+                "mixed_data_detected": False  # 将在后续处理中更新
+                # 内部参数不暴露给用户：rerank_model, rerank_strategy, kg_weight, diversity_boost
             }
             
             # Execute queries for each query text
@@ -304,32 +313,69 @@ class KnowledgeBaseServer:
             # Apply reranking if enabled and we have multiple results
             if enable_rerank and len(all_results) > 1:
                 try:
-                    from src.models.rerank import get_reranker
-                    reranker = get_reranker(rerank_model)
-                    
-                    # Prepare reranking pairs: (query, document) for each result
-                    rerank_pairs = []
-                    for result in all_results:
-                        query = result.get("original_query", "")
-                        content = result.get("content", "")
-                        if isinstance(content, dict):
-                            content = json.dumps(content, ensure_ascii=False)
-                        elif not isinstance(content, str):
-                            content = str(content)
-                        rerank_pairs.append([query, content])
-                    
-                    # Get relevance scores
-                    if rerank_pairs:
-                        scores = await reranker.acompute_score(rerank_pairs, normalize=True)
+                    # Check if this is knowledge graph data and apply specialized reranking
+                    if rerank_strategy == "auto":
+                        # 分析结果类型分布
+                        text_results = []
+                        kg_results = []
                         
-                        # Add scores to results and sort by relevance
-                        for idx, (result, score) in enumerate(zip(all_results, scores)):
-                            result["relevance_score"] = score
+                        for result in all_results:
+                            content = result.get("content", {})
+                            if isinstance(content, dict) and ("entity" in content or "entity1" in content):
+                                kg_results.append(result)
+                            else:
+                                text_results.append(result)
                         
-                        # Sort by relevance score (descending)
-                        all_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                        # 混合重排策略
+                        if kg_results and text_results:
+                            # 既有知识图谱又有文档数据，采用混合重排
+                            logger.info(f"Mixed data detected: {len(kg_results)} KG results, {len(text_results)} text results")
+                            query_metadata["mixed_data_detected"] = True
+                            
+                            # 分别重排两类数据
+                            if text_results:
+                                text_results = await self._rerank_text_results(text_results, rerank_model)
+                            if kg_results:
+                                kg_results = await self._rerank_knowledge_graph_results(kg_results, rerank_model)
+                            
+                            # 合并结果，使用归一化分数确保公平比较
+                            all_results = self._merge_mixed_results(text_results, kg_results, query_texts, 
+                                                                   kg_weight=kg_weight, diversity_boost=diversity_boost)
+                            
+                        elif kg_results:
+                            # 只有知识图谱数据
+                            all_results = await self._rerank_knowledge_graph_results(all_results, rerank_model)
+                        else:
+                            # 只有文本数据
+                            all_results = await self._rerank_text_results(all_results, rerank_model)
+                    elif rerank_strategy == "knowledge_graph":
+                        # Force knowledge graph reranking
+                        all_results = await self._rerank_knowledge_graph_results(all_results, rerank_model)
+                    elif rerank_strategy == "mixed":
+                        # 强制混合重排，不管数据类型如何
+                        query_metadata["mixed_data_detected"] = True  # 标记为混合数据
+                        text_results = []
+                        kg_results = []
                         
-                        logger.info(f"Reranked {len(all_results)} results with model {rerank_model}")
+                        for result in all_results:
+                            content = result.get("content", {})
+                            if isinstance(content, dict) and ("entity" in content or "entity1" in content):
+                                kg_results.append(result)
+                            else:
+                                text_results.append(result)
+                        
+                        # 分别重排两类数据
+                        if text_results:
+                            text_results = await self._rerank_text_results(text_results, rerank_model)
+                        if kg_results:
+                            kg_results = await self._rerank_knowledge_graph_results(kg_results, rerank_model)
+                        
+                        # 合并结果
+                        all_results = self._merge_mixed_results(text_results, kg_results, query_texts, 
+                                                               kg_weight=kg_weight, diversity_boost=diversity_boost)
+                    else:
+                        # Standard text reranking
+                        all_results = await self._rerank_text_results(all_results, rerank_model)
                         
                 except Exception as e:
                     logger.warning(f"Reranking failed: {e}. Using original results order.")
@@ -337,12 +383,21 @@ class KnowledgeBaseServer:
             # Limit results to top_k
             final_results = all_results[:top_k]
             
-            # Add metadata to results
+            # Add metadata to results (简化用户可见的元数据)
+            simplified_metadata = {
+                "total_queries": query_metadata["total_queries"],
+                "databases_queried": query_metadata["databases_queried"],
+                "total_results": len(final_results),
+                "data_types": list(set(r.get("data_type", "text") for r in final_results)) if final_results else ["text"]
+            }
+            
+            # 只在混合数据时显示额外信息
+            if query_metadata.get("mixed_data_detected", False):
+                simplified_metadata["mixed_data_detected"] = True
+            
             result_data = {
                 "results": final_results,
-                "metadata": query_metadata,
-                "total_results": len(final_results),
-                "reranked": enable_rerank
+                "metadata": simplified_metadata
             }
             
             # Ensure result is JSON-serializable
@@ -387,6 +442,359 @@ class KnowledgeBaseServer:
                 )],
                 isError=True
             )
+    
+    def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
+        """Process query result and add metadata"""
+        processed_results = []
+        
+        if result is None or result == "":
+            return processed_results
+        
+        if isinstance(result, str):
+            if result.strip() == "":
+                return processed_results
+            else:
+                # Try to parse as JSON
+                try:
+                    parsed_result = json.loads(result)
+                    result = parsed_result
+                except json.JSONDecodeError:
+                    # If not valid JSON, treat as text content
+                    processed_results.append({
+                        "content": result,
+                        "type": "text",
+                        "source_db": db_id,
+                        "source_name": source_name
+                    })
+                    return processed_results
+        
+        # Handle list results
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    item["source_db"] = db_id
+                    item["source_name"] = source_name
+                    processed_results.append(item)
+                else:
+                    processed_results.append({
+                        "content": str(item),
+                        "type": "text",
+                        "source_db": db_id,
+                        "source_name": source_name
+                    })
+        # Handle single dict result
+        elif isinstance(result, dict):
+            result["source_db"] = db_id
+            result["source_name"] = source_name
+            processed_results.append(result)
+        else:
+            # Handle other types
+            processed_results.append({
+                "content": str(result),
+                "type": "text",
+                "source_db": db_id,
+                "source_name": source_name
+            })
+        
+        return processed_results
+    
+    def _score_entity_relevance(self, entity_data: Dict[str, Any], query: str) -> float:
+        """Score entity relevance for knowledge graph data"""
+        score = 0.0
+        query_lower = query.lower()
+        
+        # Entity name matching
+        entity_name = entity_data.get("entity", "")
+        if query_lower in entity_name.lower():
+            score += 1.0
+        
+        # Type matching
+        entity_type = entity_data.get("type", "")
+        if query_lower in entity_type.lower():
+            score += 0.5
+        
+        # Description content matching
+        description = entity_data.get("description", "")
+        if "<SEP>" in description:
+            descriptions = description.split("<SEP>")
+            for desc in descriptions:
+                if query_lower in desc.lower():
+                    score += 0.3
+        else:
+            if query_lower in description.lower():
+                score += 0.3
+        
+        return score
+    
+    def _calculate_kg_weight(self, query_texts: List[str], content: Dict[str, Any], data_type: str) -> float:
+        """Calculate knowledge graph weight based on query intent and data type"""
+        if not query_texts:
+            return 0.3  # 默认权重
+        
+        # 合并所有查询文本进行分析
+        combined_query = " ".join(query_texts).lower()
+        
+        # 定义知识图谱友好的关键词
+        kg_friendly_keywords = {
+            "entity": ["实体", "概念", "定义", "是什么", "介绍", "entity", "concept", "definition"],
+            "relationship": ["关系", "联系", "关联", "连接", "之间", "relationship", "relation", "connection"],
+            "graph": ["图谱", "图", "网络", "结构", "graph", "network", "structure"]
+        }
+        
+        # 分析查询意图
+        kg_intent_score = 0.0
+        for category, keywords in kg_friendly_keywords.items():
+            for keyword in keywords:
+                if keyword in combined_query:
+                    kg_intent_score += 0.2
+        
+        # 基于数据类型的权重调整
+        if data_type == "entity":
+            base_weight = 0.4
+        elif data_type == "relationship":
+            base_weight = 0.5
+        else:
+            base_weight = 0.3
+        
+        # 最终权重 = 基础权重 + 查询意图分数（最高不超过0.8）
+        final_weight = min(base_weight + kg_intent_score, 0.8)
+        
+        # 根据内容质量微调
+        if data_type == "entity":
+            entity_name = content.get("entity", "")
+            description = content.get("description", "")
+            if len(entity_name) > 2 and len(description) > 10:
+                final_weight += 0.1  # 内容质量好的增加权重
+        
+        return min(final_weight, 0.9)  # 确保不超过0.9
+    
+    def _merge_mixed_results(self, text_results: List[Dict[str, Any]], kg_results: List[Dict[str, Any]], 
+                           query_texts: List[str] = None, kg_weight: float = None, 
+                           diversity_boost: bool = True) -> List[Dict[str, Any]]:
+        """Merge and balance text and knowledge graph results"""
+        # 确保两类结果都有合理的分数分布
+        def normalize_scores(results: List[Dict[str, Any]], score_key: str = "relevance_score") -> List[Dict[str, Any]]:
+            if not results:
+                return results
+            
+            scores = [r.get(score_key, 0) for r in results]
+            if not scores or max(scores) == min(scores):
+                # 如果没有分数或分数相同，赋予默认分数
+                for i, result in enumerate(results):
+                    result[score_key] = 0.5 + (i * 0.1)  # 简单的递减分数
+                return results
+            
+            # 归一化到0-1范围
+            min_score = min(scores)
+            max_score = max(scores)
+            score_range = max_score - min_score if max_score != min_score else 1
+            
+            for result in results:
+                original_score = result.get(score_key, 0)
+                normalized_score = (original_score - min_score) / score_range
+                result[score_key] = max(0.1, normalized_score)  # 确保最小分数不为0
+            
+            return results
+        
+        # 分别归一化两类结果的分数
+        text_results = normalize_scores(text_results, "relevance_score")
+        kg_results = normalize_scores(kg_results, "relevance_score")
+        
+        # 为知识图谱结果添加额外的专业分数权重
+        if kg_weight is None:
+            # 自动计算权重
+            for result in kg_results:
+                content = result.get("content", {})
+                if isinstance(content, dict):
+                    original_query = result.get("original_query", "")
+                    if "entity" in content:
+                        entity_score = self._score_entity_relevance(content, original_query)
+                        # 实体结果给予额外权重，考虑查询意图
+                        auto_kg_weight = self._calculate_kg_weight(query_texts, content, "entity")
+                        result["relevance_score"] = result.get("relevance_score", 0) * (1 - auto_kg_weight) + entity_score * auto_kg_weight
+                    elif "entity1" in content:
+                        rel_score = self._score_relationship_relevance(content, original_query)
+                        # 关系结果给予额外权重，考虑查询意图
+                        auto_kg_weight = self._calculate_kg_weight(query_texts, content, "relationship")
+                        result["relevance_score"] = result.get("relevance_score", 0) * (1 - auto_kg_weight) + rel_score * auto_kg_weight
+        else:
+            # 使用用户指定的权重
+            for result in kg_results:
+                content = result.get("content", {})
+                if isinstance(content, dict):
+                    original_query = result.get("original_query", "")
+                    if "entity" in content:
+                        entity_score = self._score_entity_relevance(content, original_query)
+                        result["relevance_score"] = result.get("relevance_score", 0) * (1 - kg_weight) + entity_score * kg_weight
+                    elif "entity1" in content:
+                        rel_score = self._score_relationship_relevance(content, original_query)
+                        result["relevance_score"] = result.get("relevance_score", 0) * (1 - kg_weight) + rel_score * kg_weight
+        
+        # 合并所有结果
+        all_results = text_results + kg_results
+        
+        # 按分数排序
+        all_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+        
+        # 应用多样性策略：避免同类结果过度集中
+        if diversity_boost:
+            final_results = []
+            max_consecutive_same_type = 3  # 最多连续3个同类型结果
+            
+            for result in all_results:
+                data_type = result.get("data_type", "text")
+                
+                # 检查是否需要强制插入不同类型结果以保持多样性
+                if len(final_results) >= max_consecutive_same_type:
+                    last_types = [r.get("data_type", "text") for r in final_results[-max_consecutive_same_type:]]
+                    if len(set(last_types)) == 1:  # 最近都是同类型
+                        # 寻找不同类型的高分结果
+                        opposite_type = "knowledge_graph" if data_type == "text" else "text"
+                        opposite_candidates = [r for r in all_results[len(final_results):] 
+                                               if r.get("data_type", "text") == opposite_type]
+                        
+                        if opposite_candidates:
+                            # 插入一个相反类型的最佳结果
+                            best_opposite = max(opposite_candidates, key=lambda x: x.get("relevance_score", 0))
+                            final_results.append(best_opposite)
+                            all_results.remove(best_opposite)
+                            # 继续处理当前结果
+                
+                final_results.append(result)
+                
+                # 限制总数量，保持平衡
+                if len(final_results) >= len(all_results):
+                    break
+            
+            all_results = final_results
+        
+        # 添加混合结果标识
+        for result in all_results:
+            content = result.get("content", {})
+            if isinstance(content, dict) and ("entity" in content or "entity1" in content):
+                result["data_type"] = "knowledge_graph"
+            else:
+                result["data_type"] = "text"
+        
+        logger.info(f"Merged {len(text_results)} text results and {len(kg_results)} KG results")
+        
+        return all_results
+    
+    async def _rerank_text_results(self, results: List[Dict[str, Any]], rerank_model: str) -> List[Dict[str, Any]]:
+        """Apply standard text reranking to results"""
+        try:
+            from src.models.rerank import get_reranker
+            reranker = get_reranker(rerank_model)
+            
+            # Prepare reranking pairs: (query, document) for each result
+            rerank_pairs = []
+            for result in results:
+                query = result.get("original_query", "")
+                content = result.get("content", "")
+                
+                if isinstance(content, dict):
+                    content = json.dumps(content, ensure_ascii=False)
+                elif not isinstance(content, str):
+                    content = str(content)
+                
+                rerank_pairs.append([query, content])
+            
+            # Get relevance scores
+            if rerank_pairs:
+                scores = await reranker.acompute_score(rerank_pairs, normalize=True)
+                
+                # Add scores to results and sort by relevance
+                for idx, (result, score) in enumerate(zip(results, scores)):
+                    result["relevance_score"] = score
+                
+                # Sort by relevance score (descending)
+                results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                
+                logger.info(f"Reranked {len(results)} text results with model {rerank_model}")
+            
+            return results
+            
+        except Exception as e:
+            logger.warning(f"Text reranking failed: {e}. Using original results order.")
+            return results
+    
+    async def _rerank_knowledge_graph_results(self, results: List[Dict[str, Any]], rerank_model: str) -> List[Dict[str, Any]]:
+        """Apply knowledge graph specific reranking to results"""
+        try:
+            from src.models.rerank import get_reranker
+            reranker = get_reranker(rerank_model)
+            
+            # Prepare reranking pairs: (query, document) for each result
+            rerank_pairs = []
+            for result in results:
+                query = result.get("original_query", "")
+                content = result.get("content", {})
+                
+                if isinstance(content, dict):
+                    # Check if this is knowledge graph data
+                    if "entity" in content:
+                        # Entity data
+                        content = f"Entity: {content.get('entity', '')} ({content.get('type', '')}) - {content.get('description', '')}"
+                    elif "entity1" in content:
+                        # Relationship data
+                        content = f"Relationship: {content.get('entity1', '')} -> {content.get('entity2', '')} - {content.get('description', '')}"
+                    else:
+                        # Regular dict data
+                        content = json.dumps(content, ensure_ascii=False)
+                elif not isinstance(content, str):
+                    content = str(content)
+                
+                rerank_pairs.append([query, content])
+            
+            # Get relevance scores
+            if rerank_pairs:
+                scores = await reranker.acompute_score(rerank_pairs, normalize=True)
+                
+                # Add scores to results and sort by relevance
+                for idx, (result, score) in enumerate(zip(results, scores)):
+                    result["relevance_score"] = score
+                    
+                    # For knowledge graph data, also compute specialized scores
+                    content = result.get("content", {})
+                    if isinstance(content, dict):
+                        original_query = result.get("original_query", "")
+                        if "entity" in content:
+                            # Entity data - add specialized entity relevance score
+                            entity_score = self._score_entity_relevance(content, original_query)
+                            result["entity_relevance_score"] = entity_score
+                        elif "entity1" in content:
+                            # Relationship data - add specialized relationship relevance score
+                            rel_score = self._score_relationship_relevance(content, original_query)
+                            result["relationship_relevance_score"] = rel_score
+                
+                # Sort by relevance score (descending)
+                results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                
+                logger.info(f"Reranked {len(results)} knowledge graph results with model {rerank_model}")
+            
+            return results
+            
+        except Exception as e:
+            logger.warning(f"Knowledge graph reranking failed: {e}. Using original results order.")
+            return results
+    
+    def _score_relationship_relevance(self, rel_data: Dict[str, Any], query: str) -> float:
+        """Score relationship relevance for knowledge graph data"""
+        score = 0.0
+        query_lower = query.lower()
+        
+        # Entity1 and entity2 name matching
+        for entity_field in ["entity1", "entity2"]:
+            entity_name = rel_data.get(entity_field, "")
+            if query_lower in entity_name.lower():
+                score += 0.8
+        
+        # Relationship description matching
+        description = rel_data.get("description", "")
+        if query_lower in description.lower():
+            score += 0.6
+        
+        return score
     
     def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
         """Process query result and add metadata"""

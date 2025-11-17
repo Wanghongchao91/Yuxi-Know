@@ -128,13 +128,26 @@ MCP_TOOLS: List[MCPTool] = [
                 },
                 "enable_rerank": {
                     "type": "boolean",
-                    "default": True,
-                    "description": "Enable reranking of results based on relevance"
+                    "description": "Enable reranking of results based on relevance (internal parameter)"
                 },
                 "rerank_model": {
                     "type": "string",
-                    "default": "bge-reranker-v2-m3",
-                    "description": "Reranking model to use"
+                    "description": "Reranking model to use (internal parameter)"
+                },
+                "rerank_strategy": {
+                    "type": "string", 
+                    "description": "Reranking strategy: auto (detect data type), text, knowledge_graph, or mixed (internal parameter)",
+                    "enum": ["auto", "text", "knowledge_graph", "mixed"]
+                },
+                "kg_weight": {
+                    "type": "number",
+                    "description": "Weight for knowledge graph results in mixed reranking (0.0-1.0), auto if not specified (internal parameter)",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "diversity_boost": {
+                    "type": "boolean",
+                    "description": "Enable diversity boosting to avoid consecutive same-type results (internal parameter)"
                 }
             },
             "required": ["query_text"]
