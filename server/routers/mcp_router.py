@@ -94,17 +94,24 @@ class MCPErrorResponse(BaseModel):
 MCP_TOOLS: List[MCPTool] = [
     MCPTool(
         name="query_knowledge_base",
-        description="Query all available knowledge bases with intelligent routing. IMPORTANT: Call list_knowledge_bases first to get available db_id values",
+        description="Query all available knowledge bases with intelligent routing and reranking. IMPORTANT: Call list_knowledge_bases first to get available db_id values",
         input_schema={
             "type": "object",
             "properties": {
                 "query_text": {
-                    "type": "string", 
-                    "description": "The query text to search for"
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ],
+                    "description": "The query text(s) to search for. Can be a single string or array of strings for batch queries"
                 },
                 "db_id": {
-                    "type": "string", 
-                    "description": "Specific database ID to query (optional). Use list_knowledge_bases to get available db_id values"
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"}
+                    ],
+                    "description": "Specific database ID(s) to query (optional). Use list_knowledge_bases to get available db_id values. If null or empty array, queries all databases"
                 },
                 "mode": {
                     "type": "string", 
@@ -117,7 +124,17 @@ MCP_TOOLS: List[MCPTool] = [
                     "default": MCPConfig.DEFAULT_TOP_K, 
                     "minimum": 1, 
                     "maximum": MCPConfig.MAX_TOP_K,
-                    "description": "Number of results to return"
+                    "description": "Number of results to return per query"
+                },
+                "enable_rerank": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Enable reranking of results based on relevance"
+                },
+                "rerank_model": {
+                    "type": "string",
+                    "default": "bge-reranker-v2-m3",
+                    "description": "Reranking model to use"
                 }
             },
             "required": ["query_text"]

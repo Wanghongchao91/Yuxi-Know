@@ -207,14 +207,25 @@ class KnowledgeBaseServer:
                 )
     
     async def _query_knowledge_base(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Query knowledge base with given arguments"""
+        """Query knowledge base with given arguments - supports batch queries and reranking"""
         try:
-            query_text = arguments.get("query_text", "")
-            db_id = arguments.get("db_id")
+            # Support both single query text and array of query texts
+            query_text_input = arguments.get("query_text", "")
+            db_id_input = arguments.get("db_id")
             mode = arguments.get("mode", "mix")
             top_k = arguments.get("top_k", 10)
+            enable_rerank = arguments.get("enable_rerank", True)
+            rerank_model = arguments.get("rerank_model", "bge-reranker-v2-m3")
             
-            if not query_text:
+            # Normalize query texts to list
+            if isinstance(query_text_input, str):
+                query_texts = [query_text_input]
+            elif isinstance(query_text_input, list):
+                query_texts = query_text_input
+            else:
+                query_texts = [str(query_text_input)]
+            
+            if not query_texts or not query_texts[0]:
                 return CallToolResult(
                     content=[TextContent(
                         type="text",
@@ -223,93 +234,128 @@ class KnowledgeBaseServer:
                     isError=True
                 )
             
+            # Normalize db_ids to list
+            if db_id_input is None:
+                db_ids = None  # Query all databases
+            elif isinstance(db_id_input, str):
+                db_ids = [db_id_input]
+            elif isinstance(db_id_input, list) and db_id_input:
+                db_ids = db_id_input
+            else:
+                db_ids = None  # Query all databases
+            
             # Prepare query parameters
             query_params = {
                 "mode": mode,
                 "top_k": top_k
             }
             
-            # Execute query
-            if db_id:
-                # Query specific database
-                try:
-                    result = await knowledge_base.aquery(query_text, db_id=db_id, **query_params)
-                    source_info = f"Database: {db_id}"
-                except Exception as e:
-                    logger.error(f"Error querying specific database {db_id}: {e}")
-                    error_msg = f"Database {db_id} not found or query failed: {str(e)}"
-                    if "not found" in str(e).lower():
-                        error_msg += f"\n\nDatabase '{db_id}' does not exist. Please call list_knowledge_bases first to get available database IDs."
-                    return CallToolResult(
-                        content=[TextContent(
-                            type="text",
-                            text=error_msg
-                        )],
-                        isError=True
-                    )
-            else:
-                # Query all databases and aggregate results
-                retrievers = knowledge_base.get_retrievers()
-                all_results = []
-                
-                for current_db_id, retriever_info in retrievers.items():
-                    try:
-                        db_result = await knowledge_base.aquery(query_text, db_id=current_db_id, **query_params)
-                        if db_result:
-                            # Add source information to each result
-                            if isinstance(db_result, list):
-                                for item in db_result:
-                                    if isinstance(item, dict):
-                                        item["source_db"] = current_db_id
-                                        item["source_name"] = retriever_info["name"]
-                                all_results.extend(db_result if isinstance(db_result, list) else [db_result])
-                            else:
-                                all_results.append({
-                                    "content": db_result,
-                                    "source_db": current_db_id,
-                                    "source_name": retriever_info["name"]
-                                })
-                    except Exception as e:
-                        logger.warning(f"Error querying database {current_db_id}: {e}")
-                        continue
-                
-                result = all_results[:top_k]  # Limit total results
-                source_info = f"Searched {len(retrievers)} databases"
+            # Collect all results from all queries
+            all_results = []
+            query_metadata = {
+                "total_queries": len(query_texts),
+                "databases_queried": [],
+                "rerank_enabled": enable_rerank,
+                "rerank_model": rerank_model if enable_rerank else None
+            }
             
-            # Handle empty or invalid results
-            if result is None or result == "":
-                result = []
-            elif isinstance(result, str):
-                # If result is already a string, try to parse it as JSON
-                if result.strip() == "":
-                    # Handle empty string case
-                    result = []
+            # Execute queries for each query text
+            for query_idx, query_text in enumerate(query_texts):
+                if db_ids:
+                    # Query specific databases
+                    for db_id in db_ids:
+                        try:
+                            result = await knowledge_base.aquery(query_text, db_id=db_id, **query_params)
+                            if result and db_id not in query_metadata["databases_queried"]:
+                                query_metadata["databases_queried"].append(db_id)
+                            
+                            # Process and add source info
+                            processed_results = self._process_query_result(result, db_id, f"Database: {db_id}")
+                            for item in processed_results:
+                                item["query_index"] = query_idx
+                                item["original_query"] = query_text
+                            all_results.extend(processed_results)
+                            
+                        except Exception as e:
+                            logger.warning(f"Error querying database {db_id} with query '{query_text}': {e}")
+                            continue
                 else:
-                    try:
-                        parsed_result = json.loads(result)
-                        result = parsed_result
-                    except json.JSONDecodeError:
-                        # If it's not valid JSON, wrap it in a simple structure
-                        result = [{"text": result, "type": "text"}]
+                    # Query all databases
+                    retrievers = knowledge_base.get_retrievers()
+                    query_metadata["databases_queried"] = list(retrievers.keys())
+                    
+                    for current_db_id, retriever_info in retrievers.items():
+                        try:
+                            db_result = await knowledge_base.aquery(query_text, db_id=current_db_id, **query_params)
+                            
+                            # Process and add source info
+                            processed_results = self._process_query_result(
+                                db_result, current_db_id, retriever_info.get("name", current_db_id)
+                            )
+                            for item in processed_results:
+                                item["query_index"] = query_idx
+                                item["original_query"] = query_text
+                            all_results.extend(processed_results)
+                            
+                        except Exception as e:
+                            logger.warning(f"Error querying database {current_db_id} with query '{query_text}': {e}")
+                            continue
             
-            # Ensure result is JSON-serializable with proper fallback
-            try:
-                result_text = json.dumps(result, ensure_ascii=False)
-            except (TypeError, ValueError) as json_error:
-                # If result can't be JSON serialized, create a safe fallback
-                logger.warning(f"Result could not be JSON serialized, using fallback: {json_error}")
+            # Apply reranking if enabled and we have multiple results
+            if enable_rerank and len(all_results) > 1:
                 try:
-                    # Try to convert to a basic structure
-                    if isinstance(result, (list, tuple)):
-                        result_text = json.dumps([str(item) for item in result], ensure_ascii=False)
-                    elif isinstance(result, dict):
-                        result_text = json.dumps({str(k): str(v) for k, v in result.items()}, ensure_ascii=False)
-                    else:
-                        result_text = json.dumps([{"text": str(result), "type": "text"}], ensure_ascii=False)
-                except Exception as fallback_error:
-                    # Last resort: return empty array as JSON
-                    result_text = "[]"
-                    logger.error(f"Even fallback serialization failed: {fallback_error}")
+                    from src.models.rerank import get_reranker
+                    reranker = get_reranker(rerank_model)
+                    
+                    # Prepare reranking pairs: (query, document) for each result
+                    rerank_pairs = []
+                    for result in all_results:
+                        query = result.get("original_query", "")
+                        content = result.get("content", "")
+                        if isinstance(content, dict):
+                            content = json.dumps(content, ensure_ascii=False)
+                        elif not isinstance(content, str):
+                            content = str(content)
+                        rerank_pairs.append([query, content])
+                    
+                    # Get relevance scores
+                    if rerank_pairs:
+                        scores = await reranker.acompute_score(rerank_pairs, normalize=True)
+                        
+                        # Add scores to results and sort by relevance
+                        for idx, (result, score) in enumerate(zip(all_results, scores)):
+                            result["relevance_score"] = score
+                        
+                        # Sort by relevance score (descending)
+                        all_results.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                        
+                        logger.info(f"Reranked {len(all_results)} results with model {rerank_model}")
+                        
+                except Exception as e:
+                    logger.warning(f"Reranking failed: {e}. Using original results order.")
+            
+            # Limit results to top_k
+            final_results = all_results[:top_k]
+            
+            # Add metadata to results
+            result_data = {
+                "results": final_results,
+                "metadata": query_metadata,
+                "total_results": len(final_results),
+                "reranked": enable_rerank
+            }
+            
+            # Ensure result is JSON-serializable
+            try:
+                result_text = json.dumps(result_data, ensure_ascii=False, indent=2)
+            except (TypeError, ValueError) as json_error:
+                logger.warning(f"Result could not be JSON serialized: {json_error}")
+                # Fallback to basic structure
+                fallback_data = {
+                    "results": [{"text": str(result), "type": "text"} for result in final_results],
+                    "metadata": {"error": "JSON serialization failed, using fallback"}
+                }
+                result_text = json.dumps(fallback_data, ensure_ascii=False)
             
             return CallToolResult(
                 content=[TextContent(
@@ -341,6 +387,61 @@ class KnowledgeBaseServer:
                 )],
                 isError=True
             )
+    
+    def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
+        """Process query result and add metadata"""
+        processed_results = []
+        
+        if result is None or result == "":
+            return processed_results
+        
+        if isinstance(result, str):
+            if result.strip() == "":
+                return processed_results
+            else:
+                # Try to parse as JSON
+                try:
+                    parsed_result = json.loads(result)
+                    result = parsed_result
+                except json.JSONDecodeError:
+                    # If not valid JSON, treat as text content
+                    processed_results.append({
+                        "content": result,
+                        "type": "text",
+                        "source_db": db_id,
+                        "source_name": source_name
+                    })
+                    return processed_results
+        
+        # Handle list results
+        if isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    item["source_db"] = db_id
+                    item["source_name"] = source_name
+                    processed_results.append(item)
+                else:
+                    processed_results.append({
+                        "content": str(item),
+                        "type": "text",
+                        "source_db": db_id,
+                        "source_name": source_name
+                    })
+        # Handle single dict result
+        elif isinstance(result, dict):
+            result["source_db"] = db_id
+            result["source_name"] = source_name
+            processed_results.append(result)
+        else:
+            # Handle other types
+            processed_results.append({
+                "content": str(result),
+                "type": "text",
+                "source_db": db_id,
+                "source_name": source_name
+            })
+        
+        return processed_results
     
     async def _list_knowledge_bases(self) -> CallToolResult:
         """List all available knowledge bases"""
