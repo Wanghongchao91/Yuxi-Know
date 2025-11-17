@@ -94,7 +94,7 @@ class MCPErrorResponse(BaseModel):
 MCP_TOOLS: List[MCPTool] = [
     MCPTool(
         name="query_knowledge_base",
-        description="Query all available knowledge bases with intelligent routing and reranking. IMPORTANT: Call list_knowledge_bases first to get available db_id values",
+        description="Single-DB query; db_id is REQUIRED. One call queries one database only. Call multiple times to query different databases. Use list_knowledge_bases first to get db_id values",
         input_schema={
             "type": "object",
             "properties": {
@@ -106,12 +106,8 @@ MCP_TOOLS: List[MCPTool] = [
                     "description": "The query text(s) to search for. Can be a single string or array of strings for batch queries"
                 },
                 "db_id": {
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                        {"type": "null"}
-                    ],
-                    "description": "Specific database ID(s) to query (optional). Use list_knowledge_bases to get available db_id values. If null or empty array, queries all databases"
+                    "type": "string",
+                    "description": "REQUIRED. Specific database ID to query. Use list_knowledge_bases to get available db_id values"
                 },
                 "mode": {
                     "type": "string", 
@@ -150,7 +146,7 @@ MCP_TOOLS: List[MCPTool] = [
                     "description": "Enable diversity boosting to avoid consecutive same-type results (internal parameter)"
                 }
             },
-            "required": ["query_text"]
+            "required": ["query_text", "db_id"]
         }
     ),
     MCPTool(
@@ -909,10 +905,11 @@ async def get_mcp_info():
             "initialization": "Send initialize JSON-RPC request",
             "tools": {
                 "list": "Use tools/list method",
-                "call": "Use tools/call method with name and arguments"
+                "call": "Use tools/call method with name and arguments. query_knowledge_base REQUIRES db_id and queries ONE database per call; call multiple times to query different databases"
             },
             "streaming": "Use GET with Accept: text/event-stream for SSE"
         },
+        "notes": "Call list_knowledge_bases first to get available db_id values. A single call may not return all desired information; issue multiple calls for different databases as needed",
         "tools": tools_info,
         "compliance": {
             "standard": "MCP Specification 2024-11-05",

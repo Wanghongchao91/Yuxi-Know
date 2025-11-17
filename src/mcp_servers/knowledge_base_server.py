@@ -85,7 +85,7 @@ class KnowledgeBaseServer:
                 # Create a general query tool
                 tools.append(Tool(
                     name="query_knowledge_base",
-                    description="Query all available knowledge bases with intelligent routing and automatic reranking. Results are automatically optimized for relevance using advanced reranking algorithms.",
+                    description="Single-DB query; db_id is REQUIRED. One call queries one database only. Call multiple times to query different databases. Use list_knowledge_bases first to get db_id values.",
                     inputSchema={
                         "type": "object",
                         "properties": {
@@ -95,7 +95,38 @@ class KnowledgeBaseServer:
                             },
                             "db_id": {
                                 "type": "string",
-                                "description": "Specific database ID to query (optional). Use list_knowledge_bases to get available db_id values"
+                                "description": "REQUIRED. Specific database ID to query. Use list_knowledge_bases to get available db_id values"
+                            },
+                            "mode": {
+                                "type": "string",
+                                "description": "Query mode",
+                                "enum": ["local", "global", "hybrid", "naive", "mix"]
+                            },
+                            "top_k": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return",
+                                "minimum": 1,
+                                "maximum": 100
+                            }
+                        },
+                        "required": ["query_text", "db_id"]
+                    }
+                ))
+                
+                # Create specific tools for each database
+                for db_id, retriever_info in retrievers.items():
+                    safe_name = retriever_info["name"].replace(" ", "_").replace("-", "_")[:30]
+                    tool_name = f"query_{safe_name}_{db_id}"
+                    
+                tools.append(Tool(
+                    name=tool_name,
+                    description=f"Query {retriever_info['name']} knowledge base. db_id is embedded in tool name; no db_id argument required. {retriever_info.get('description', '')}",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "query_text": {
+                                "type": "string",
+                                "description": "The query text to search for"
                             },
                             "mode": {
                                 "type": "string",
@@ -112,37 +143,6 @@ class KnowledgeBaseServer:
                         "required": ["query_text"]
                     }
                 ))
-                
-                # Create specific tools for each database
-                for db_id, retriever_info in retrievers.items():
-                    safe_name = retriever_info["name"].replace(" ", "_").replace("-", "_")[:30]
-                    tool_name = f"query_{safe_name}_{db_id}"
-                    
-                    tools.append(Tool(
-                        name=tool_name,
-                        description=f"Query {retriever_info['name']} knowledge base. {retriever_info.get('description', '')}",
-                        inputSchema={
-                            "type": "object",
-                            "properties": {
-                                "query_text": {
-                                    "type": "string",
-                                    "description": "The query text to search for"
-                                },
-                                "mode": {
-                                    "type": "string",
-                                    "description": "Query mode",
-                                    "enum": ["local", "global", "hybrid", "naive", "mix"]
-                                },
-                                "top_k": {
-                                    "type": "integer",
-                                    "description": "Maximum number of results to return",
-                                    "minimum": 1,
-                                    "maximum": 100
-                                }
-                            },
-                            "required": ["query_text"]
-                        }
-                    ))
                 
                 # Add database listing tool
                 tools.append(Tool(
