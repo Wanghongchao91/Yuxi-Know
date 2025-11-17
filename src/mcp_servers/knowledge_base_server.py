@@ -516,15 +516,23 @@ class KnowledgeBaseServer:
         return processed_results
     
     def _detect_kb_type(self, db_id: str, source_name: str) -> str:
-        """Detect knowledge base type from db_id or source name"""
+        try:
+            retrievers = knowledge_base.get_retrievers()
+            info = retrievers.get(db_id)
+            if info:
+                meta = info.get("metadata", {})
+                kb_type = meta.get("kb_type") or info.get("kb_type") or ""
+                if isinstance(kb_type, str) and kb_type:
+                    return kb_type.lower()
+        except Exception:
+            pass
         if "lightrag" in source_name.lower() or "lightrag" in db_id.lower():
             return "lightrag"
-        elif "chroma" in source_name.lower() or "chroma" in db_id.lower():
+        if "chroma" in source_name.lower() or "chroma" in db_id.lower():
             return "chroma"
-        elif "milvus" in source_name.lower() or "milvus" in db_id.lower():
+        if "milvus" in source_name.lower() or "milvus" in db_id.lower():
             return "milvus"
-        else:
-            return "unknown"
+        return "unknown"
     
     def _detect_data_type(self, result: Dict[str, Any]) -> str:
         """Detect data type based on content structure"""
