@@ -374,7 +374,10 @@ class MCPRequestHandler:
                         else:
                             content.append({"type": item.type, "text": raw_text})
                     elif isinstance(item, dict):
-                        content.append(item)
+                        try:
+                            content.append({"type": "text", "text": json.dumps(item, ensure_ascii=False)})
+                        except Exception:
+                            content.append({"type": "text", "text": str(item)})
                     else:
                         content.append({"type": "text", "text": str(item)})
         elif hasattr(result, 'content') and result.content:
@@ -383,7 +386,10 @@ class MCPRequestHandler:
                 if hasattr(item, 'text'):
                     content.append({"type": "text", "text": item.text})
                 elif isinstance(item, dict):
-                    content.append(item)
+                    try:
+                        content.append({"type": "text", "text": json.dumps(item, ensure_ascii=False)})
+                    except Exception:
+                        content.append({"type": "text", "text": str(item)})
                 else:
                     content.append({"type": "text", "text": str(item)})
         else:

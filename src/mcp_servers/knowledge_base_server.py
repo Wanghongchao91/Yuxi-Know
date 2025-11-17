@@ -548,8 +548,12 @@ class KnowledgeBaseServer:
         """Check if text contains knowledge graph data patterns"""
         kg_patterns = [
             "entity:", "entities:", "relationship:", "relationships:",
-            "Entity:", "Entities:", "Relationship:", "Relationships:",
-            "知识图谱", "实体", "关系", "[knowledge graph data]"
+            "知识图谱", "实体", "关系", "[knowledge graph data]",
+            "knowledge graph data (entity)",
+            "knowledge graph data (relationship)",
+            "document chunks",
+            "参考文档",
+            "```json"
         ]
         text_lower = text.lower()
         return any(pattern.lower() in text_lower for pattern in kg_patterns)
@@ -1301,6 +1305,11 @@ class KnowledgeBaseServer:
                     })
         # Handle single dict result
         elif isinstance(result, dict):
+            # If LightRAG packed output as {"content": "formatted text"}, parse it
+            if kb_type == "lightrag":
+                content_val = result.get("content")
+                if isinstance(content_val, str) and self._is_knowledge_graph_output(content_val):
+                    return self._process_lightrag_kg_output(content_val, db_id, source_name)
             result["source_db"] = db_id
             result["source_name"] = source_name
             result["kb_type"] = kb_type
