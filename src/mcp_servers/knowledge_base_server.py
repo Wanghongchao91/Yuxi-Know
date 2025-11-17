@@ -594,7 +594,88 @@ class KnowledgeBaseServer:
         except json.JSONDecodeError:
             pass
         
-        # Fallback: parse as formatted text
+        # Parse LightRAG's formatted text output
+        # The format is: "Knowledge Graph Data (Entity):" followed by JSON objects
+        # and "Knowledge Graph Data (Relationship):" followed by JSON objects
+        
+        lines = kg_text.strip().split('\n')
+        current_section = None
+        json_buffer = ""
+        in_json = False
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Detect section headers
+            if "Knowledge Graph Data (Entity)" in line or "实体" in line.lower():
+                current_section = "entity"
+                continue
+            elif "Knowledge Graph Data (Relationship)" in line or "关系" in line.lower():
+                current_section = "relationship"
+                continue
+            elif "Document Chunks" in line or "参考" in line:
+                current_section = "chunks"
+                continue
+            
+            # Parse JSON objects from the formatted output
+            if current_section in ["entity", "relationship"]:
+                # Check if this line starts a JSON object
+                if line.startswith('{"'):
+                    in_json = True
+                    json_buffer = line
+                elif in_json:
+                    json_buffer += line
+                    # Check if we've completed a JSON object
+                    if line.endswith('}'):
+                        try:
+                            parsed_obj = json.loads(json_buffer)
+                            if current_section == "entity" and "entity" in parsed_obj:
+                                processed_results.append({
+                                    "content": parsed_obj,
+                                    "type": "entity",
+                                    "source_db": db_id,
+                                    "source_name": source_name,
+                                    "kb_type": "lightrag",
+                                    "data_type": "knowledge_graph"
+                                })
+                            elif current_section == "relationship" and ("entity1" in parsed_obj or "entity2" in parsed_obj):
+                                processed_results.append({
+                                    "content": parsed_obj,
+                                    "type": "relationship",
+                                    "source_db": db_id,
+                                    "source_name": source_name,
+                                    "kb_type": "lightrag",
+                                    "data_type": "knowledge_graph"
+                                })
+                            json_buffer = ""
+                            in_json = False
+                        except json.JSONDecodeError:
+                            # Continue building the JSON string
+                            continue
+            
+            # Parse document chunks
+            elif current_section == "chunks":
+                if line.startswith('{"reference_id"'):
+                    try:
+                        parsed_obj = json.loads(line)
+                        processed_results.append({
+                            "content": parsed_obj,
+                            "type": "chunk",
+                            "source_db": db_id,
+                            "source_name": source_name,
+                            "kb_type": "lightrag",
+                            "data_type": "document_chunk"
+                        })
+                    except json.JSONDecodeError:
+                        continue
+        
+        # If we found parsed results, return them
+        if processed_results:
+            return processed_results
+        
+        # Fallback: parse as formatted text (original logic)
         lines = kg_text.strip().split('\n')
         current_section = None
         
@@ -686,30 +767,46 @@ class KnowledgeBaseServer:
         return processed_results
     
     def _score_entity_relevance(self, entity_data: Dict[str, Any], query: str) -> float:
-        """Score entity relevance for knowledge graph data"""
+        """Score entity relevance for knowledge graph data with enhanced scoring"""
         score = 0.0
         query_lower = query.lower()
         
-        # Entity name matching
+        # Entity name matching (highest weight)
         entity_name = entity_data.get("entity", "")
-        if query_lower in entity_name.lower():
+        entity_name_lower = entity_name.lower()
+        
+        # Exact match gets highest score
+        if query_lower == entity_name_lower:
+            score += 2.0
+        # Partial match at beginning
+        elif entity_name_lower.startswith(query_lower):
+            score += 1.5
+        # Contains query
+        elif query_lower in entity_name_lower:
             score += 1.0
         
-        # Type matching
+        # Type matching (medium weight)
         entity_type = entity_data.get("type", "")
         if query_lower in entity_type.lower():
-            score += 0.5
+            score += 0.3
         
-        # Description content matching
+        # Description content matching (lower weight but cumulative)
         description = entity_data.get("description", "")
         if "<SEP>" in description:
             descriptions = description.split("<SEP>")
+            desc_matches = 0
             for desc in descriptions:
                 if query_lower in desc.lower():
-                    score += 0.3
+                    desc_matches += 1
+            # Cap at 0.5 for description matches
+            score += min(0.1 * desc_matches, 0.5)
         else:
             if query_lower in description.lower():
-                score += 0.3
+                score += 0.2
+        
+        # Bonus for high-quality content
+        if len(entity_name) > 2 and len(description) > 20:
+            score += 0.1
         
         return score
     
@@ -1086,20 +1183,42 @@ class KnowledgeBaseServer:
             return results
     
     def _score_relationship_relevance(self, rel_data: Dict[str, Any], query: str) -> float:
-        """Score relationship relevance for knowledge graph data"""
+        """Score relationship relevance for knowledge graph data with enhanced scoring"""
         score = 0.0
         query_lower = query.lower()
         
-        # Entity1 and entity2 name matching
+        # Entity1 and entity2 name matching (higher weight for exact matches)
         for entity_field in ["entity1", "entity2"]:
             entity_name = rel_data.get(entity_field, "")
-            if query_lower in entity_name.lower():
-                score += 0.8
+            entity_name_lower = entity_name.lower()
+            
+            # Exact match gets highest score
+            if query_lower == entity_name_lower:
+                score += 1.5
+            # Partial match at beginning
+            elif entity_name_lower.startswith(query_lower):
+                score += 1.0
+            # Contains query
+            elif query_lower in entity_name_lower:
+                score += 0.6
         
         # Relationship description matching
         description = rel_data.get("description", "")
-        if query_lower in description.lower():
-            score += 0.6
+        if "<SEP>" in description:
+            descriptions = description.split("<SEP>")
+            desc_matches = 0
+            for desc in descriptions:
+                if query_lower in desc.lower():
+                    desc_matches += 1
+            # Cap at 0.8 for description matches
+            score += min(0.15 * desc_matches, 0.8)
+        else:
+            if query_lower in description.lower():
+                score += 0.5
+        
+        # Bonus for high-quality relationships
+        if len(description) > 10:
+            score += 0.1
         
         return score
     
