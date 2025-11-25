@@ -37,7 +37,7 @@
       <!-- 对话数和工具调用数分布 -->
       <a-col :span="24">
         <div class="chart-container">
-          <h4>对话/工具调用分布</h4>
+          <h4>对话/工具调用分布 (TOP 3)</h4>
           <div ref="conversationToolChartRef" class="chart"></div>
         </div>
       </a-col>
@@ -99,6 +99,15 @@
 import { ref, onMounted, watch, nextTick, computed } from 'vue'
 import * as echarts from 'echarts'
 import { getColorByIndex, getChartColor } from '@/utils/chartColors'
+import { useThemeStore } from '@/stores/theme'
+
+// CSS 变量解析工具函数
+function getCSSVariable(variableName, element = document.documentElement) {
+  return getComputedStyle(element).getPropertyValue(variableName).trim()
+}
+
+// theme store
+const themeStore = useThemeStore()
 
 // Props
 const props = defineProps({
@@ -177,25 +186,51 @@ const initConversationToolChart = () => {
       (!props.agentStats?.agent_conversation_counts?.length &&
        !props.agentStats?.agent_tool_usage?.length)) return
 
+  // 如果已存在图表实例，先销毁
+  if (conversationToolChart) {
+    conversationToolChart.dispose()
+    conversationToolChart = null
+  }
+
   conversationToolChart = echarts.init(conversationToolChartRef.value)
 
   const conversationData = props.agentStats.agent_conversation_counts || []
   const toolData = props.agentStats.agent_tool_usage || []
 
-  // 获取所有智能体ID
-  const allAgentIds = [...new Set([
-    ...conversationData.map(item => item.agent_id),
-    ...toolData.map(item => item.agent_id)
-  ])]
+  // 获取所有智能体ID并按对话数+工具调用数排序，取前3个
+  const allAgentStats = {}
+
+  // 统计每个智能体的总数据量（对话数 + 工具调用数）
+  conversationData.forEach(item => {
+    if (!allAgentStats[item.agent_id]) {
+      allAgentStats[item.agent_id] = { conversation: 0, tool: 0, total: 0 }
+    }
+    allAgentStats[item.agent_id].conversation = item.conversation_count
+    allAgentStats[item.agent_id].total += item.conversation_count
+  })
+
+  toolData.forEach(item => {
+    if (!allAgentStats[item.agent_id]) {
+      allAgentStats[item.agent_id] = { conversation: 0, tool: 0, total: 0 }
+    }
+    allAgentStats[item.agent_id].tool = item.tool_usage_count
+    allAgentStats[item.agent_id].total += item.tool_usage_count
+  })
+
+  // 按总数据量降序排序，取前3个
+  const topAgentIds = Object.entries(allAgentStats)
+    .sort(([,a], [,b]) => b.total - a.total)
+    .slice(0, 3)
+    .map(([agentId]) => agentId)
 
   const option = {
     tooltip: {
       trigger: 'axis',
-      backgroundColor: 'rgba(255, 255, 255, 0.95)',
-      borderColor: '#e8e8e8',
+      backgroundColor: getCSSVariable('--gray-0'),
+      borderColor: getCSSVariable('--gray-200'),
       borderWidth: 1,
       textStyle: {
-        color: '#666'
+        color: getCSSVariable('--gray-600')
       }
     },
     legend: {
@@ -204,7 +239,7 @@ const initConversationToolChart = () => {
       top: '0%',
       orient: 'horizontal',
       textStyle: {
-        color: '#666'
+        color: getCSSVariable('--gray-500')
       }
     },
     grid: {
@@ -216,14 +251,14 @@ const initConversationToolChart = () => {
     },
     xAxis: {
       type: 'category',
-      data: allAgentIds,
+      data: topAgentIds,
       axisLine: {
         lineStyle: {
-          color: '#e8e8e8'
+          color: getCSSVariable('--gray-200')
         }
       },
       axisLabel: {
-        color: '#666',
+        color: getCSSVariable('--gray-500'),
         interval: 0,
         // rotate: 45
       }
@@ -232,15 +267,15 @@ const initConversationToolChart = () => {
       type: 'value',
       axisLine: {
         lineStyle: {
-          color: '#e8e8e8'
+          color: getCSSVariable('--gray-200')
         }
       },
       axisLabel: {
-        color: '#666'
+        color: getCSSVariable('--gray-500')
       },
       splitLine: {
         lineStyle: {
-          color: '#f0f0f0'
+          color: getCSSVariable('--gray-150')
         }
       }
     },
@@ -248,7 +283,7 @@ const initConversationToolChart = () => {
       {
         name: '对话数',
         type: 'bar',
-        data: allAgentIds.map(agentId => {
+        data: topAgentIds.map(agentId => {
           const item = conversationData.find(d => d.agent_id === agentId)
           return item ? item.conversation_count : 0
         }),
@@ -260,14 +295,14 @@ const initConversationToolChart = () => {
           itemStyle: {
             color: getChartColor('primary'),
             shadowBlur: 10,
-            shadowColor: 'rgba(2, 142, 160, 0.3)'
+            shadowColor: getCSSVariable('--chart-info-shadow')
           }
         }
       },
       {
         name: '工具调用数',
         type: 'bar',
-        data: allAgentIds.map(agentId => {
+        data: topAgentIds.map(agentId => {
           const item = toolData.find(d => d.agent_id === agentId)
           return item ? item.tool_usage_count : 0
         }),
@@ -279,7 +314,7 @@ const initConversationToolChart = () => {
           itemStyle: {
             color: getChartColor('primary'),
             shadowBlur: 10,
-            shadowColor: 'rgba(2, 142, 160, 0.3)'
+            shadowColor: getCSSVariable('--chart-info-shadow')
           }
         }
       }
@@ -313,6 +348,15 @@ onMounted(() => {
   window.addEventListener('resize', handleResize)
 })
 
+// 监听主题变化，重新渲染图表
+watch(() => themeStore.isDark, () => {
+  if (props.agentStats && conversationToolChart) {
+    nextTick(() => {
+      updateCharts()
+    })
+  }
+})
+
 // 组件卸载时清理
 const cleanup = () => {
   window.removeEventListener('resize', handleResize)
@@ -329,6 +373,39 @@ defineExpose({
 </script>
 
 <style scoped lang="less">
+
+/* 指标值样式 */
+.metric-value {
+  font-weight: 500;
+  color: var(--gray-1000);
+  font-size: 14px;
+}
+
+
+/* 排名显示样式 */
+.rank-display {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  .rank-medal {
+    font-size: 20px;
+  }
+
+  .rank-number {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background-color: var(--gray-100);
+    border-radius: 50%;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--gray-600);
+    border: 1px solid var(--gray-200);
+  }
+}
 
 // AgentStatsComponent 特有的样式
 .top-performers, .metrics-comparison {
@@ -353,4 +430,5 @@ defineExpose({
 :deep(.ant-progress-bg) {
   transition: all 0.3s ease;
 }
+
 </style>

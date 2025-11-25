@@ -604,7 +604,7 @@ onMounted(() => {
     border-radius: 12px;
     padding: 16px;
     margin-top: 16px;
-    background: #fafafa;
+    background: var(--gray-25);
 
     .reranker-row {
       display: flex;
@@ -670,12 +670,12 @@ onMounted(() => {
     }
 
     .kb-type-card {
-      border: 2px solid #f0f0f0;
+      border: 2px solid var(--gray-150);
       border-radius: 12px;
       padding: 20px;
       cursor: pointer;
       transition: all 0.3s ease;
-      background: white;
+      background: var(--gray-0);
       position: relative;
       overflow: hidden;
 
@@ -685,20 +685,20 @@ onMounted(() => {
 
       // 为不同知识库类型设置不同的悬停颜色
       &:nth-child(1):hover {
-        border-color: #d3adf7;
+        border-color: var(--chart-secondary-light);
       }
 
       &:nth-child(2):hover {
-        border-color: #ffd591;
+        border-color: var(--chart-warning-light);
       }
 
       &:nth-child(3):hover {
-        border-color: #ffadd2;
+        border-color: var(--chart-error-light);
       }
 
       &.active {
         border-color: var(--main-color);
-        background: #f8faff;
+        background: rgba(24, 144, 255, 0.05);
 
         .type-icon {
           color: var(--main-color);
@@ -713,48 +713,48 @@ onMounted(() => {
       // 为不同知识库类型设置不同的主题色
       &:nth-child(1) {
         &.active {
-          border-color: #d3adf7;
-          background: #f9f0ff;
+          border-color: var(--chart-secondary-light);
+          background: rgba(114, 46, 209, 0.05);
 
           .type-icon {
-            color: #722ed1;
+            color: var(--chart-secondary);
           }
 
           .feature-tag {
             background: rgba(114, 46, 209, 0.1);
-            color: #722ed1;
+            color: var(--chart-secondary);
           }
         }
       }
 
       &:nth-child(2) {
         &.active {
-          border-color: #ffd591;
-          background: #fff7e6;
+          border-color: var(--chart-warning-light);
+          background: rgba(250, 140, 22, 0.05);
 
           .type-icon {
-            color: #fa8c16;
+            color: var(--chart-warning);
           }
 
           .feature-tag {
             background: rgba(250, 140, 22, 0.1);
-            color: #fa8c16;
+            color: var(--chart-warning);
           }
         }
       }
 
       &:nth-child(3) {
         &.active {
-          border-color: #ffadd2;
-          background: #fff1f0;
+          border-color: var(--chart-error-light);
+          background: rgba(245, 34, 45, 0.05);
 
           .type-icon {
-            color: #f5222d;
+            color: var(--chart-error);
           }
 
           .feature-tag {
             background: rgba(245, 34, 45, 0.1);
-            color: #f5222d;
+            color: var(--chart-error);
           }
         }
       }
@@ -791,7 +791,7 @@ onMounted(() => {
         .feature-tag {
           display: inline-block;
           padding: 4px 8px;
-          background: rgba(24, 144, 255, 0.1);
+          background: rgba(24, 144, 255, 0.08);
           color: var(--main-color);
           border-radius: 6px;
           font-size: 12px;
@@ -804,9 +804,9 @@ onMounted(() => {
   .chunk-config {
     margin-top: 16px;
     padding: 12px 16px;
-    background-color: #fafafa;
+    background-color: var(--gray-25);
     border-radius: 6px;
-    border: 1px solid #f0f0f0;
+    border: 1px solid var(--gray-150);
 
     h3 {
       margin-top: 0;
@@ -871,95 +871,108 @@ onMounted(() => {
 }
 
 .database, .graphbase {
-  background-color: white;
-  box-shadow: 0px 1px 2px 0px rgba(16,24,40,.06),0px 1px 3px 0px rgba(16,24,40,.1);
-  border: 2px solid white;
-  transition: box-shadow 0.2s ease-in-out;
-
-  &:hover {
-    box-shadow: 0px 4px 6px -2px rgba(16,24,40,.03),0px 12px 16px -4px rgba(16,24,40,.08);
-  }
+  background: linear-gradient(145deg, var(--gray-0) 0%, var(--gray-10) 100%);
+  box-shadow: 0px 1px 2px 0px var(--shadow-2);
+  border: 1px solid var(--gray-100);
+  transition: none;
+  position: relative;
 }
 
 .dbcard, .database {
   width: 100%;
-  padding: 10px;
-  border-radius: 12px;
-  height: 160px;
-  padding: 20px;
+  padding: 24px;
+  border-radius: 16px;
+  height: 180px;
   cursor: pointer;
   display: flex;
   flex-direction: column;
   position: relative; // 为绝对定位的锁定图标提供参考
+  overflow: hidden;
 
   .private-lock-icon {
     position: absolute;
-    top: 24px;
-    right: 16px;
-    color: var(--gray-700);
-    background: var(--gray-100);
+    top: 20px;
+    right: 20px;
+    color: var(--gray-600);
+    background: linear-gradient(135deg, var(--gray-0) 0%, var(--gray-100) 100%);
     font-size: 12px;
-    border-radius: 6px;
-    padding: 5px;
-    z-index: 1;
+    border-radius: 8px;
+    padding: 6px;
+    z-index: 2;
+    box-shadow: 0px 2px 4px var(--shadow-2);
+    border: 1px solid var(--gray-100);
   }
+
 
   .top {
     display: flex;
     align-items: center;
-    height: 50px;
-    margin-bottom: 10px;
+    height: 54px;
+    margin-bottom: 14px;
 
     .icon {
-      width: 50px;
-      height: 50px;
-      font-size: 28px;
-      margin-right: 10px;
+      width: 54px;
+      height: 54px;
+      font-size: 26px;
+      margin-right: 14px;
       display: flex;
       justify-content: center;
       align-items: center;
-      background-color: #F5F8FF;
-      border-radius: 8px;
-      border: 1px solid #E0EAFF;
+      background: var(--main-30);
+      border-radius: 12px;
+      border: 1px solid var(--gray-200);
       color: var(--main-color);
+      position: relative;
     }
 
     .info {
       h3, p {
         margin: 0;
-        color: black;
+        color: var(--gray-10000);
       }
 
       h3 {
-        font-size: 16px;
-        font-weight: bold;
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+        line-height: 1.4;
       }
 
       p {
-        color: var(--gray-900);
-        font-size: small;
+        color: var(--gray-700);
+        font-size: 13px;
         display: flex;
         align-items: center;
         gap: 8px;
         flex-wrap: wrap;
+        margin-top: 4px;
+        font-weight: 400;
 
         .created-time-inline {
           color: var(--gray-500);
-          font-size: 12px;
+          font-size: 11px;
+          font-weight: 400;
+          background: var(--gray-50);
+          padding: 2px 6px;
+          border-radius: 4px;
         }
       }
     }
   }
 
   .description {
-    color: var(--gray-900);
+    color: var(--gray-600);
     overflow: hidden;
     display: -webkit-box;
-    line-clamp: 1;
-    -webkit-line-clamp: 1;
+    line-clamp: 2;
+    -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
     text-overflow: ellipsis;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    font-weight: 400;
+    flex: 1;
   }
 
 
