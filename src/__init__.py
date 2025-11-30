@@ -1,6 +1,8 @@
-from dotenv import load_dotenv
-
-load_dotenv(".env", override=True)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(".env", override=True)
+except Exception:
+    pass
 
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 

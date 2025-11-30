@@ -1,4 +1,5 @@
 import os
+import re
 import traceback
 
 from lightrag import LightRAG, QueryParam
@@ -141,8 +142,62 @@ class LightRagKB(KnowledgeBase):
     async def _initialize_kb_instance(self, instance: LightRAG) -> None:
         """初始化 LightRAG 实例"""
         logger.info(f"Initializing LightRAG instance for {instance.working_dir}")
+        self._patch_neo4j_async_transaction_run()
         await instance.initialize_storages()
         await initialize_pipeline_status()
+
+    def _patch_neo4j_async_transaction_run(self) -> None:
+        try:
+            from neo4j._async.work import transaction as _txn_mod
+        except Exception:
+            return
+
+        if hasattr(self, "_neo4j_run_patched") and getattr(self, "_neo4j_run_patched"):
+            return
+
+        if not hasattr(_txn_mod, "Transaction"):
+            return
+
+        Transaction = _txn_mod.Transaction
+        if not hasattr(Transaction, "run"):
+            return
+
+        original_run = Transaction.run
+
+        def _fix_set_labels_in_query(q: str) -> str:
+            lines = q.splitlines()
+            fixed = []
+            for line in lines:
+                if re.search(r"\bSET\s+n\s*:\s*", line):
+                    prefix, rest = re.split(r"(\bSET\s+n\s*:\s*)", line, maxsplit=1)[1:]
+                    label_part = rest.strip()
+                    parts = label_part.split(":")
+                    norm_labels = []
+                    for p in parts:
+                        lp = p.strip()
+                        lp = lp.strip("`")
+                        if not lp:
+                            continue
+                        norm_labels.append(f"`{lp}`")
+                    new_line = prefix + ":".join(norm_labels)
+                    fixed.append(new_line)
+                else:
+                    fixed.append(line)
+            return "\n".join(fixed)
+
+        def patched_run(self, query, parameters=None, *args, **kwargs):
+            try:
+                if isinstance(query, str) and "SET" in query and "n:" in query:
+                    query = _fix_set_labels_in_query(query)
+            except Exception:
+                pass
+            return original_run(self, query, parameters, *args, **kwargs)
+
+        try:
+            setattr(Transaction, "run", patched_run)
+            setattr(self, "_neo4j_run_patched", True)
+        except Exception:
+            pass
 
     async def _get_lightrag_instance(self, db_id: str) -> LightRAG | None:
         """获取或创建 LightRAG 实例"""

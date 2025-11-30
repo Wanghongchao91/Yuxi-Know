@@ -115,13 +115,27 @@ class BaseReranker(ABC):
             try:
                 loop = asyncio.get_event_loop()
             except RuntimeError:
-                asyncio.run(self.aclose())
+                try:
+                    asyncio.run(self.aclose())
+                except Exception:
+                    pass
                 return
 
             if loop.is_closed():
-                asyncio.run(self.aclose())
-            elif not loop.is_running():
-                loop.run_until_complete(self.aclose())
+                try:
+                    asyncio.run(self.aclose())
+                except Exception:
+                    pass
+            elif loop.is_running():
+                try:
+                    loop.create_task(self.aclose())
+                except Exception:
+                    pass
+            else:
+                try:
+                    loop.run_until_complete(self.aclose())
+                except Exception:
+                    pass
 
 
 class OpenAIReranker(BaseReranker):
