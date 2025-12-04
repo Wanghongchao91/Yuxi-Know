@@ -1,4 +1,5 @@
 import os
+import asyncio
 import re
 import traceback
 
@@ -240,15 +241,26 @@ class LightRagKB(KnowledgeBase):
         model = select_model(model_spec=model_spec)
 
         async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs):
-            return await openai_complete_if_cache(
-                model=model.model_name,
-                prompt=prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=model.api_key,
-                base_url=model.base_url,
-                **kwargs,
-            )
+            timeout_s = int(os.getenv("LR_LLM_TIMEOUT", "180"))
+            retries = int(os.getenv("LR_LLM_RETRIES", "4"))
+            last_exc = None
+            for _ in range(max(1, retries)):
+                try:
+                    return await asyncio.wait_for(
+                        openai_complete_if_cache(
+                            model=model.model_name,
+                            prompt=prompt,
+                            system_prompt=system_prompt,
+                            history_messages=history_messages,
+                            api_key=model.api_key,
+                            base_url=model.base_url,
+                            **kwargs,
+                        ),
+                        timeout=timeout_s,
+                    )
+                except Exception as e:
+                    last_exc = e
+            return ""
 
         return llm_model_func
 

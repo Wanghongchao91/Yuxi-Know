@@ -88,7 +88,7 @@ class TaskContext:
 
 
 class Tasker:
-    def __init__(self, worker_count: int = 2):
+    def __init__(self, worker_count: int = 4):
         self.worker_count = max(1, worker_count)
         self._queue: asyncio.Queue[tuple[str, TaskCoroutine]] = asyncio.Queue()
         self._tasks: dict[str, Task] = {}
