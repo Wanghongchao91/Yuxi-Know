@@ -144,6 +144,7 @@ class LightRagKB(KnowledgeBase):
         """初始化 LightRAG 实例"""
         logger.info(f"Initializing LightRAG instance for {instance.working_dir}")
         self._patch_neo4j_async_transaction_run()
+        self._patch_lightrag_worker_timeout()
         await instance.initialize_storages()
         await initialize_pipeline_status()
 
@@ -197,6 +198,33 @@ class LightRagKB(KnowledgeBase):
         try:
             setattr(Transaction, "run", patched_run)
             setattr(self, "_neo4j_run_patched", True)
+        except Exception:
+            pass
+
+    def _patch_lightrag_worker_timeout(self) -> None:
+        try:
+            from lightrag import utils as lr_utils
+        except Exception:
+            return
+
+        if hasattr(self, "_lr_wait_patched") and getattr(self, "_lr_wait_patched"):
+            return
+
+        if not hasattr(lr_utils, "wait_func"):
+            return
+
+        original_wait_func = lr_utils.wait_func
+
+        async def safe_wait_func(queue_name, future):
+            try:
+                timeout_s = int(os.getenv("LR_WORKER_TIMEOUT", os.getenv("LR_LLM_TIMEOUT", "180")))
+                return await asyncio.wait_for(future, timeout=timeout_s)
+            except Exception:
+                return ""
+
+        try:
+            lr_utils.wait_func = safe_wait_func
+            setattr(self, "_lr_wait_patched", True)
         except Exception:
             pass
 
