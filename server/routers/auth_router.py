@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status, UploadFi
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from src.storage.db.manager import db_manager
 from src.storage.db.models import User
@@ -397,9 +399,13 @@ async def create_user(
 # 路由：获取所有用户（管理员权限）
 @auth.get("/users", response_model=list[UserResponse])
 async def read_users(
-    skip: int = 0, limit: int = 100, current_user: User = Depends(get_admin_user), db: Session = Depends(get_db)
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_admin_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    users = db.query(User).filter(User.is_deleted == 0).offset(skip).limit(limit).all()
+    result = await db.execute(select(User).filter(User.is_deleted == 0).offset(skip).limit(limit))
+    users = result.scalars().all()
     return [user.to_dict() for user in users]
 
 
