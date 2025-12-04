@@ -6,13 +6,15 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from src.storage.db.manager import db_manager
 from src.storage.db.models import User
 from server.utils.auth_middleware import get_admin_user, get_current_user, get_db, get_required_user
 from server.utils.auth_utils import AuthUtils
 from server.utils.user_utils import generate_unique_user_id, validate_username, is_valid_phone_number
-from server.utils.common_utils import log_operation
+from server.utils.common_utils import log_operation, log_operation_async
 from src.storage.minio import upload_image_to_minio
 from src.utils.datetime_utils import utc_now
 
@@ -91,16 +93,18 @@ class UserIdGeneration(BaseModel):
 
 
 @auth.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
     # 查找用户 - 支持user_id和phone_number登录
     login_identifier = form_data.username  # OAuth2表单中的username字段作为登录标识符
 
     # 尝试通过user_id查找
-    user = db.query(User).filter(User.user_id == login_identifier).first()
+    result = await db.execute(select(User).filter(User.user_id == login_identifier))
+    user = result.scalar_one_or_none()
 
     # 如果通过user_id没找到，尝试通过phone_number查找
     if not user:
-        user = db.query(User).filter(User.phone_number == login_identifier).first()
+        result = await db.execute(select(User).filter(User.phone_number == login_identifier))
+        user = result.scalar_one_or_none()
 
     # 如果用户不存在，为防止用户名枚举攻击，返回通用错误信息
     if not user:
@@ -131,10 +135,10 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     if not AuthUtils.verify_password(user.password_hash, form_data.password):
         # 密码错误，增加失败次数
         user.increment_failed_login()
-        db.commit()
+        await db.commit()
 
         # 记录失败操作
-        log_operation(db, user.id if user else None, "登录失败", f"密码错误，失败次数: {user.login_failed_count}")
+        await log_operation_async(db, user.id if user else None, "登录失败", f"密码错误，失败次数: {user.login_failed_count}")
 
         # 检查是否需要锁定
         if user.is_login_locked():
@@ -154,14 +158,14 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     # 登录成功，重置失败计数器
     user.reset_failed_login()
     user.last_login = utc_now()
-    db.commit()
+    await db.commit()
 
     # 生成访问令牌
     token_data = {"sub": str(user.id)}
     access_token = AuthUtils.create_access_token(token_data)
 
     # 记录登录操作
-    log_operation(db, user.id, "登录")
+    await log_operation_async(db, user.id, "登录")
 
     return {
         "access_token": access_token,

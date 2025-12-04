@@ -4,6 +4,7 @@ import logging
 
 from fastapi import Request
 from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.storage.db.models import OperationLog, User
 
@@ -38,6 +39,16 @@ def log_operation(db: Session, user_id: int, operation: str, details: str = None
     log = OperationLog(user_id=user_id, operation=operation, details=details, ip_address=ip_address)
     db.add(log)
     db.commit()
+
+
+async def log_operation_async(db: AsyncSession, user_id: int, operation: str, details: str = None, request: Request = None):
+    ip_address = None
+    if request:
+        ip_address = request.client.host if request.client else None
+
+    log = OperationLog(user_id=user_id, operation=operation, details=details, ip_address=ip_address)
+    db.add(log)
+    await db.commit()
 
 
 def get_user_dict(user: User, include_password: bool = False) -> dict:
