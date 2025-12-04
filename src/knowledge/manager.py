@@ -303,9 +303,13 @@ class KnowledgeBaseManager:
             # 添加全局元数据中的additional_params信息
             if db_info and db_id in self.global_databases_meta:
                 global_meta = self.global_databases_meta[db_id]
-                additional_params = global_meta.get("additional_params", {})
-                if additional_params:
-                    db_info["additional_params"] = additional_params
+                additional_params = global_meta.get("additional_params", {}).copy()
+
+                # 确保 auto_generate_questions 存在，默认为 False
+                if "auto_generate_questions" not in additional_params:
+                    additional_params["auto_generate_questions"] = False
+
+                db_info["additional_params"] = additional_params
 
             return db_info
         except KBNotFoundError:
@@ -351,7 +355,33 @@ class KnowledgeBaseManager:
         os.makedirs(general_uploads, exist_ok=True)
         return general_uploads
 
-    def file_existed_in_db(self, db_id: str | None, content_hash: str | None) -> bool:
+    async def file_name_existed_in_db(self, db_id: str | None, file_name: str | None) -> bool:
+        """检查指定数据库中是否存在同名的文件"""
+        if not db_id or not file_name:
+            return False
+        try:
+            kb_instance = self._get_kb_for_database(db_id)
+        except KBNotFoundError:
+            return False
+
+        for file_info in kb_instance.files_meta.values():
+            if file_info.get("database_id") != db_id:
+                continue
+            if file_info.get("status") == "failed":
+                continue
+            if file_info.get("file_name") == file_name:
+                return True
+
+        return False
+
+    async def update_file(self, db_id: str, region_file_id: str, file_name: str, params: dict | None = None) -> dict:
+        """对单个文件执行更新"""
+        kb_instance = self._get_kb_for_database(db_id)
+        await kb_instance.delete_file(db_id, region_file_id)
+        data_list = await kb_instance.add_content(db_id, [file_name], params or {})
+        return data_list[0]
+
+    async def file_existed_in_db(self, db_id: str | None, content_hash: str | None) -> bool:
         """检查指定数据库中是否存在相同内容哈希的文件"""
         if not db_id or not content_hash:
             return False
@@ -371,7 +401,9 @@ class KnowledgeBaseManager:
 
         return False
 
-    async def update_database(self, db_id: str, name: str, description: str, llm_info: dict = None) -> dict:
+    async def update_database(
+        self, db_id: str, name: str, description: str, llm_info: dict = None, additional_params: dict | None = None
+    ) -> dict:
         """更新数据库"""
         kb_instance = self._get_kb_for_database(db_id)
         result = kb_instance.update_database(db_id, name, description, llm_info)
@@ -380,6 +412,16 @@ class KnowledgeBaseManager:
             if db_id in self.global_databases_meta:
                 self.global_databases_meta[db_id]["name"] = name
                 self.global_databases_meta[db_id]["description"] = description
+
+                # 合并现有的 additional_params 和新的 additional_params
+                existing_additional_params = self.global_databases_meta[db_id].get("additional_params", {})
+                if additional_params:
+                    existing_additional_params.update(additional_params)
+                self.global_databases_meta[db_id]["additional_params"] = existing_additional_params
+
+                # 清理旧的 top-level key (如果存在)
+                self.global_databases_meta[db_id].pop("auto_generate_questions", None)
+
                 self._save_global_metadata()
 
         return result

@@ -1,9 +1,11 @@
 import asyncio
 import os
 import re
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
+import aiofiles
 from langchain_community.document_loaders import (
     CSVLoader,
     JSONLoader,
@@ -46,6 +48,47 @@ def is_supported_file_extension(file_name: str | os.PathLike[str]) -> bool:
     return Path(file_name).suffix.lower() in SUPPORTED_FILE_EXTENSIONS
 
 
+def _make_unique_columns(columns: list) -> list:
+    """
+    处理重复的列名,给重复的列添加数字后缀
+
+    Args:
+        columns: 原始列名列表
+
+    Returns:
+        处理后的唯一列名列表
+
+    Example:
+        ['A', 'B', 'A', 'C', 'B'] -> ['A', 'B', 'A_2', 'C', 'B_2']
+    """
+    if not columns:
+        return columns
+
+    seen = {}
+    unique_columns = []
+
+    for col in columns:
+        # 处理 None 或空值
+        if col is None or (isinstance(col, str) and not col.strip()):
+            col = "Unnamed"
+
+        # 转换为字符串
+        col_str = str(col)
+
+        # 如果这个列名已经出现过
+        if col_str in seen:
+            seen[col_str] += 1
+            # 添加后缀
+            unique_col = f"{col_str}_{seen[col_str]}"
+            unique_columns.append(unique_col)
+        else:
+            # 第一次出现
+            seen[col_str] = 1
+            unique_columns.append(col_str)
+
+    return unique_columns
+
+
 def _extract_word_text(file_path: Path) -> str:
     """
     Parse Word documents (.doc/.docx) into plain text.
@@ -70,6 +113,85 @@ def _extract_word_text(file_path: Path) -> str:
     except Exception as unstructured_error:  # noqa: BLE001
         logger.error(f"Unstructured failed to parse {file_path.name}: {unstructured_error}")
         raise ValueError(f"无法解析 Word 文档: {file_path.name}") from unstructured_error
+
+
+def _extract_docx_markdown_with_images(file_path: Path, params: dict | None = None) -> str:
+    params = params or {}
+    db_id = params.get("db_id") or "word-docs"
+    minio_client = get_minio_client()
+    bucket_name = "kb-images"
+    minio_client.ensure_bucket_exists(bucket_name)
+    file_id = hashstr(file_path.name, length=16)
+
+    with zipfile.ZipFile(file_path, "r") as zf:
+        rels_path = "word/_rels/document.xml.rels"
+        rid_to_target: dict[str, str] = {}
+        try:
+            rels_xml = zf.read(rels_path).decode("utf-8")
+            rels_root = ET.fromstring(rels_xml)
+            for rel in list(rels_root):
+                rid = rel.attrib.get("Id")
+                target = rel.attrib.get("Target")
+                rtype = rel.attrib.get("Type")
+                if rid and target and rtype and rtype.endswith("/image"):
+                    rid_to_target[rid] = target
+        except Exception:
+            rid_to_target = {}
+
+        doc_xml = zf.read("word/document.xml").decode("utf-8")
+        ns = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+        root = ET.fromstring(doc_xml)
+        md_lines: list[str] = []
+
+        for p in root.findall(".//w:p", ns):
+            texts = [t.text or "" for t in p.findall(".//w:t", ns)]
+            para_text = "".join(texts).strip()
+            image_urls: list[tuple[str, str]] = []
+
+            for blip in p.findall(".//a:blip", ns):
+                rid = blip.attrib.get(f"{{{ns['r']}}}embed")
+                if not rid:
+                    continue
+                target = rid_to_target.get(rid)
+                if not target:
+                    continue
+                media_path = target if target.startswith("word/") else f"word/{target}"
+                try:
+                    data = zf.read(media_path)
+                    object_name = f"{db_id}/{file_id}/images/{Path(target).name}"
+                    suffix = Path(target).suffix.lower()
+                    content_type = {
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                        ".bmp": "image/bmp",
+                        ".tif": "image/tiff",
+                        ".tiff": "image/tiff",
+                    }.get(suffix, "image/jpeg")
+                    result = minio_client.upload_file(
+                        bucket_name=bucket_name,
+                        object_name=object_name,
+                        data=data,
+                        content_type=content_type,
+                    )
+                    image_urls.append((Path(target).name, result.url))
+                except Exception as e:
+                    logger.error(f"上传图片失败 {Path(target).name}: {e}")
+                    continue
+
+            line = para_text
+            for name, url in image_urls:
+                line = f"{line}\n![{name}]({url})"
+            if line:
+                md_lines.append(line)
+
+    return "\n\n".join(md_lines)
 
 
 def chunk_with_parser(file_path, params=None):
@@ -294,8 +416,11 @@ async def process_file_to_markdown(file_path: str, params: dict | None = None) -
             content = f.read()
         return f"# {file_path_obj.name}\n\n{content}"
 
-    elif file_ext in [".doc", ".docx"]:
-        # 处理 Word 文档
+    elif file_ext == ".docx":
+        text = _extract_docx_markdown_with_images(file_path_obj, params=params)
+        return f"# {file_path_obj.name}\n\n" + text
+
+    elif file_ext == ".doc":
         text = _extract_word_text(file_path_obj)
         return f"# {file_path_obj.name}\n\n{text}"
 
@@ -332,20 +457,66 @@ async def process_file_to_markdown(file_path: str, params: dict | None = None) -
     elif file_ext in [".xls", ".xlsx"]:
         # 处理 Excel 文件
         import pandas as pd
+        from openpyxl import load_workbook
 
-        # 读取所有工作表
-        excel_file = pd.ExcelFile(file_path_obj)
         markdown_content = f"# {file_path_obj.name}\n\n"
 
-        for sheet_name in excel_file.sheet_names:
-            df = pd.read_excel(file_path_obj, sheet_name=sheet_name)
+        # 使用 openpyxl 加载工作簿以正确处理合并单元格
+        wb = load_workbook(file_path_obj, data_only=True)
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+
+            # 先取消所有合并单元格，并填充值
+            merged_ranges = list(ws.merged_cells.ranges)
+
+            for merged_range in merged_ranges:
+                # 获取合并区域左上角单元格的值
+                min_row, min_col, max_row, max_col = (
+                    merged_range.min_row,
+                    merged_range.min_col,
+                    merged_range.max_row,
+                    merged_range.max_col,
+                )
+
+                # 获取左上角单元格的值
+                top_left_value = ws.cell(row=min_row, column=min_col).value
+
+                # 取消合并
+                ws.unmerge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
+
+                # 在所有原合并单元格区域填充值
+                for row in range(min_row, max_row + 1):
+                    for col in range(min_col, max_col + 1):
+                        ws.cell(row=row, column=col).value = top_left_value
+
+            # 转换为DataFrame
+            data = []
+            for row in ws.iter_rows(values_only=True):
+                data.append(row)
+
+            # 第一行作为列名
+            columns = data[0] if data else []
+            df_data = data[1:] if len(data) > 1 else []
+
+            # 处理重复的列名,给重复的列添加后缀
+            columns = _make_unique_columns(columns)
+
+            df = pd.DataFrame(df_data, columns=columns)
+
             markdown_content += f"## {sheet_name}\n\n"
 
-            # 将每一行数据与表头组合成独立的表格
-            for index, row in df.iterrows():
-                # 创建包含表头和当前行的小表格
-                row_df = pd.DataFrame([row], columns=df.columns)
-                markdown_table = row_df.to_markdown(index=False)
+            # 在最左列添加标题字段
+            table_title = f"{file_path_obj.stem} - {sheet_name}"  # 使用"文件名 - Sheet名"作为标题
+            df.insert(0, "表格标题", table_title)
+
+            # 将每10行数据与表头组合成独立的表格
+            chunk_size = 10
+            for i in range(0, len(df), chunk_size):
+                # 获取当前10行数据(或剩余不足10行的数据)
+                chunk_df = df.iloc[i : i + chunk_size]
+                markdown_content += f"### 数据行 {i + 1}-{min(i + chunk_size, len(df))}\n\n"
+                markdown_table = chunk_df.to_markdown(index=False)
                 markdown_content += f"{markdown_table}\n\n"
 
         return markdown_content.strip()
@@ -354,8 +525,9 @@ async def process_file_to_markdown(file_path: str, params: dict | None = None) -
         # 处理 JSON 文件
         import json
 
-        with open(file_path_obj, encoding="utf-8") as f:
-            data = json.load(f)
+        async with aiofiles.open(file_path_obj, encoding="utf-8") as f:
+            content = await f.read()
+        data = json.loads(content)
         # 将 JSON 数据格式化为 markdown 代码块
         json_str = json.dumps(data, ensure_ascii=False, indent=2)
         return f"# {file_path_obj.name}\n\n```json\n{json_str}\n```"
@@ -430,7 +602,7 @@ def _process_zip_file(zip_path: str, db_id: str) -> dict:
             markdown_content = _replace_image_links(markdown_content, images_info)
 
     # 4. 生成结果
-    content_hash = calculate_content_hash(markdown_content.encode("utf-8"))
+    content_hash = asyncio.run(calculate_content_hash(markdown_content.encode("utf-8")))
 
     return {
         "markdown_content": markdown_content,
@@ -458,7 +630,7 @@ def _find_images_directory(zip_file: zipfile.ZipFile, md_file_path: str) -> str 
     return None
 
 
-def _process_images(zip_file: zipfile.ZipFile, images_dir: str, db_id: str, md_file_path: str) -> list[dict]:
+async def _process_images(zip_file: zipfile.ZipFile, images_dir: str, db_id: str, md_file_path: str) -> list[dict]:
     """处理图片：上传到MinIO并返回信息"""
     # 支持的图片格式
     SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -475,7 +647,7 @@ def _process_images(zip_file: zipfile.ZipFile, images_dir: str, db_id: str, md_f
     image_names = [n for n in zip_file.namelist() if n.startswith(images_dir + "/")]
 
     # 上传图片到MinIO
-    minio_client = get_minio_client()
+    minio_client = await get_minio_client()
     bucket_name = "kb-images"
     minio_client.ensure_bucket_exists(bucket_name)
 

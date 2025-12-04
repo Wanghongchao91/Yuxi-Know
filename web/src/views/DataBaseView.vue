@@ -11,23 +11,28 @@
     <a-modal :open="state.openNewDatabaseModel" title="新建知识库" @ok="createDatabase" @cancel="cancelCreateDatabase" class="new-database-modal" width="800px">
 
       <!-- 知识库类型选择 -->
-      <h3>知识库类型<span style="color: var(--error-color)">*</span></h3>
+      <h3>知识库类型<span style="color: var(--color-error-500)">*</span></h3>
       <div class="kb-type-cards">
         <div
-          v-for="(typeInfo, typeKey) in supportedKbTypes"
+          v-for="(typeInfo, typeKey) in orderedKbTypes"
           :key="typeKey"
           class="kb-type-card"
           :class="{ active: newDatabase.kb_type === typeKey }"
+          :data-type="typeKey"
           @click="handleKbTypeChange(typeKey)"
         >
           <div class="card-header">
             <component :is="getKbTypeIcon(typeKey)" class="type-icon" />
             <span class="type-title">{{ getKbTypeLabel(typeKey) }}</span>
+            <a-tooltip
+              v-if="typeKey === 'chroma'"
+              title="Chroma 已标记为弃用状态，建议使用 Milvus 替代。同时会在下个正式版本中移除。"
+              placement="top"
+            >
+              <span class="deprecated-badge">弃用</span>
+            </a-tooltip>
           </div>
           <div class="card-description">{{ typeInfo.description }}</div>
-          <div class="card-features">
-            <span class="feature-tag">{{ getKbTypeFeature(typeKey) }}</span>
-          </div>
         </div>
       </div>
 
@@ -41,7 +46,7 @@
         />
       </div> -->
 
-      <h3>知识库名称<span style="color: var(--error-color)">*</span></h3>
+      <h3>知识库名称<span style="color: var(--color-error-500)">*</span></h3>
       <a-input v-model:value="newDatabase.name" placeholder="新建知识库名称" size="large" />
 
       <h3>嵌入模型</h3>
@@ -74,7 +79,7 @@
       <a-textarea
         v-model:value="newDatabase.description"
         placeholder="新建知识库描述"
-        :auto-size="{ minRows: 5, maxRows: 10 }"
+        :auto-size="{ minRows: 3, maxRows: 10 }"
       />
 
       <h3 style="margin-top: 20px;">隐私设置</h3>
@@ -161,6 +166,18 @@
       <p>正在加载知识库...</p>
     </div>
 
+    <!-- 空状态显示 -->
+    <div v-else-if="!databases || databases.length === 0" class="empty-state">
+      <h3 class="empty-title">暂无知识库</h3>
+      <p class="empty-description">创建您的第一个知识库，开始管理文档和知识</p>
+      <a-button type="primary" size="large" @click="state.openNewDatabaseModel = true">
+        <template #icon>
+          <PlusOutlined />
+        </template>
+        创建知识库
+      </a-button>
+    </div>
+
     <!-- 数据库列表 -->
     <div v-else class="databases">
       <div
@@ -183,7 +200,7 @@
             <p>
               <span>{{ database.files ? Object.keys(database.files).length : 0 }} 文件</span>
               <span class="created-time-inline" v-if="database.created_at">
-                • {{ formatCreatedTime(database.created_at) }}
+                {{ formatCreatedTime(database.created_at) }}
               </span>
             </p>
           </div>
@@ -216,7 +233,7 @@ import { useRouter, useRoute } from 'vue-router';
 import { useConfigStore } from '@/stores/config';
 import { message } from 'ant-design-vue'
 import { Database, Zap, FileDigit,  Waypoints, Building2 } from 'lucide-vue-next';
-import { LockOutlined, InfoCircleOutlined, QuestionCircleOutlined } from '@ant-design/icons-vue';
+import { LockOutlined, InfoCircleOutlined, QuestionCircleOutlined, PlusOutlined } from '@ant-design/icons-vue';
 import { databaseApi, typeApi } from '@/apis/knowledge_api';
 import HeaderComponent from '@/components/HeaderComponent.vue';
 import ModelSelectorComponent from '@/components/ModelSelectorComponent.vue';
@@ -259,7 +276,7 @@ const createEmptyDatabaseForm = () => ({
   name: '',
   description: '',
   embed_model_name: configStore.config?.embed_model,
-  kb_type: 'chroma',
+  kb_type: 'milvus',
   is_private: false,
   storage: '',
   language: 'English',
@@ -297,6 +314,27 @@ const llmModelSpec = computed(() => {
 
 // 支持的知识库类型
 const supportedKbTypes = ref({})
+
+// 有序的知识库类型（Chroma 排在最后）
+const orderedKbTypes = computed(() => {
+  const types = { ...supportedKbTypes.value }
+  const ordered = {}
+  const chromaData = types.chroma
+
+  // 先添加除了 Chroma 之外的所有类型
+  Object.keys(types).forEach(key => {
+    if (key !== 'chroma') {
+      ordered[key] = types[key]
+    }
+  })
+
+  // 最后添加 Chroma（如果存在）
+  if (chromaData) {
+    ordered.chroma = chromaData
+  }
+
+  return ordered
+})
 
 // 加载支持的知识库类型
 const loadSupportedKbTypes = async () => {
@@ -371,24 +409,6 @@ const getKbTypeIcon = (type) => {
   return icons[type] || Database
 }
 
-// const getKbTypeDescription = (type) => {
-//   const descriptions = {
-//     lightrag: '🔥 图结构索引 • 智能查询 • 关系挖掘 • 复杂推理',
-//     chroma: '⚡ 轻量向量 • 快速开发 • 本地部署 • 简单易用',
-//     milvus: '🚀 生产级 • 高性能 • 分布式 • 企业级部署'
-//   }
-//   return descriptions[type] || ''
-// }
-
-const getKbTypeAlertType = (type) => {
-  const types = {
-    lightrag: 'info',
-    chroma: 'success',
-    milvus: 'warning'
-  }
-  return types[type] || 'info'
-}
-
 const getKbTypeColor = (type) => {
   const colors = {
     lightrag: 'purple',
@@ -396,15 +416,6 @@ const getKbTypeColor = (type) => {
     milvus: 'red'
   }
   return colors[type] || 'blue'
-}
-
-const getKbTypeFeature = (type) => {
-  const features = {
-    lightrag: '图结构索引',
-    chroma: '轻量向量',
-    milvus: '生产级部署'
-  }
-  return features[type] || ''
 }
 
 // 格式化创建时间
@@ -612,6 +623,10 @@ onMounted(() => {
       justify-content: space-between;
       margin-bottom: 16px;
 
+      &:last-child {
+        margin-bottom: 0;
+      }
+
       .reranker-title {
         display: flex;
         align-items: center;
@@ -653,6 +668,10 @@ onMounted(() => {
           margin-top: 6px;
           font-size: 12px;
           color: var(--gray-500);
+
+          &:last-child {
+            margin-top: 0;
+          }
         }
       }
     }
@@ -672,7 +691,7 @@ onMounted(() => {
     .kb-type-card {
       border: 2px solid var(--gray-150);
       border-radius: 12px;
-      padding: 20px;
+      padding: 16px;
       cursor: pointer;
       transition: all 0.3s ease;
       background: var(--gray-0);
@@ -683,80 +702,10 @@ onMounted(() => {
         border-color: var(--main-color);
       }
 
-      // 为不同知识库类型设置不同的悬停颜色
-      &:nth-child(1):hover {
-        border-color: var(--chart-secondary-light);
-      }
-
-      &:nth-child(2):hover {
-        border-color: var(--chart-warning-light);
-      }
-
-      &:nth-child(3):hover {
-        border-color: var(--chart-error-light);
-      }
-
       &.active {
         border-color: var(--main-color);
-        background: rgba(24, 144, 255, 0.05);
-
-        .type-icon {
-          color: var(--main-color);
-        }
-
-        .feature-tag {
-          background: rgba(24, 144, 255, 0.1);
-          color: var(--main-color);
-        }
-      }
-
-      // 为不同知识库类型设置不同的主题色
-      &:nth-child(1) {
-        &.active {
-          border-color: var(--chart-secondary-light);
-          background: rgba(114, 46, 209, 0.05);
-
-          .type-icon {
-            color: var(--chart-secondary);
-          }
-
-          .feature-tag {
-            background: rgba(114, 46, 209, 0.1);
-            color: var(--chart-secondary);
-          }
-        }
-      }
-
-      &:nth-child(2) {
-        &.active {
-          border-color: var(--chart-warning-light);
-          background: rgba(250, 140, 22, 0.05);
-
-          .type-icon {
-            color: var(--chart-warning);
-          }
-
-          .feature-tag {
-            background: rgba(250, 140, 22, 0.1);
-            color: var(--chart-warning);
-          }
-        }
-      }
-
-      &:nth-child(3) {
-        &.active {
-          border-color: var(--chart-error-light);
-          background: rgba(245, 34, 45, 0.05);
-
-          .type-icon {
-            color: var(--chart-error);
-          }
-
-          .feature-tag {
-            background: rgba(245, 34, 45, 0.1);
-            color: var(--chart-error);
-          }
-        }
+        background: var(--main-10);
+        .type-icon { color: var(--main-color); }
       }
 
       .card-header {
@@ -783,21 +732,29 @@ onMounted(() => {
         font-size: 13px;
         color: var(--gray-600);
         line-height: 1.5;
-        margin-bottom: 12px;
+        margin-bottom: 0;
         // min-height: 40px;
       }
 
-      .card-features {
-        .feature-tag {
-          display: inline-block;
-          padding: 4px 8px;
-          background: rgba(24, 144, 255, 0.08);
-          color: var(--main-color);
-          border-radius: 6px;
-          font-size: 12px;
-          font-weight: 500;
+      .deprecated-badge {
+        background: var(--color-error-100);
+        color: var(--color-error-600);
+        font-size: 10px;
+        font-weight: 600;
+        padding: 2px 6px;
+        border-radius: 4px;
+        margin-left: auto;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        cursor: help;
+        transition: all 0.2s ease;
+
+        &:hover {
+          background: var(--color-error-200);
+          color: var(--color-error-700);
         }
       }
+
     }
   }
 
@@ -920,7 +877,7 @@ onMounted(() => {
       align-items: center;
       background: var(--main-30);
       border-radius: 12px;
-      border: 1px solid var(--gray-200);
+      border: 1px solid var(--gray-150);
       color: var(--main-color);
       position: relative;
     }
@@ -964,18 +921,15 @@ onMounted(() => {
     color: var(--gray-600);
     overflow: hidden;
     display: -webkit-box;
-    line-clamp: 2;
-    -webkit-line-clamp: 2;
+    line-clamp: 1;
+    -webkit-line-clamp: 1;
     -webkit-box-orient: vertical;
     text-overflow: ellipsis;
     margin-bottom: 12px;
     font-size: 13px;
-    line-height: 1.5;
     font-weight: 400;
     flex: 1;
   }
-
-
 }
 
 .database-empty {
@@ -985,6 +939,38 @@ onMounted(() => {
   height: 100%;
   flex-direction: column;
   color: var(--gray-900);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 100px 20px;
+  text-align: center;
+
+  .empty-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--gray-900);
+    margin: 0 0 12px 0;
+    letter-spacing: -0.02em;
+  }
+
+  .empty-description {
+    font-size: 14px;
+    color: var(--gray-600);
+    margin: 0 0 32px 0;
+    line-height: 1.5;
+    max-width: 320px;
+  }
+
+  .ant-btn {
+    height: 44px;
+    padding: 0 24px;
+    font-size: 15px;
+    font-weight: 500;
+  }
 }
 
 .database-container {

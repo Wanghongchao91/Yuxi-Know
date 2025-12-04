@@ -162,7 +162,6 @@
         <ModelProvidersComponent />
       </div>
 
-      <!-- TODO 用户管理优化，添加姓名（默认使用用户名配置项） -->
       <div class="setting" v-if="(state.windowWidth <= 520 || state.section === 'user') && userStore.isAdmin">
          <UserManagementComponent />
       </div>
@@ -293,9 +292,9 @@ const getModelStatusIcon = (modelId) => {
 const getModelStatusColor = (modelId) => {
   const status = state.modelStatuses[modelId]
   if (!status) return 'var(--gray-500)'
-  if (status.status === 'available') return 'var(--color-success)'
-  if (status.status === 'unavailable') return 'var(--color-error)'
-  if (status.status === 'error') return 'var(--color-warning)'
+  if (status.status === 'available') return 'var(--color-success-500)'
+  if (status.status === 'unavailable') return 'var(--color-error-500)'
+  if (status.status === 'error') return 'var(--color-warning-500)'
   return 'var(--gray-500)'
 }
 // 获取模型状态提示文本
