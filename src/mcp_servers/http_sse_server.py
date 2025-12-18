@@ -11,6 +11,7 @@ import json
 import logging
 import uuid
 from typing import Any, Dict, Optional
+from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
@@ -52,6 +53,8 @@ class MCPHTTPSSETransport:
     def __init__(self):
         self.sessions: Dict[str, Dict[str, Any]] = {}
         self.mcp_server = None
+        self.window_seconds = 10
+        self.max_requests = 50
         
     async def initialize_mcp_server(self):
         """Initialize the MCP server instance"""
@@ -64,7 +67,8 @@ class MCPHTTPSSETransport:
         session_id = str(uuid.uuid4())
         self.sessions[session_id] = {
             "message_queue": asyncio.Queue(),
-            "initialized": False
+            "initialized": False,
+            "timestamps": deque()
         }
         return session_id
         
@@ -86,6 +90,20 @@ class MCPHTTPSSETransport:
                     "message": "Invalid session"
                 }
             }
+        now = asyncio.get_event_loop().time()
+        timestamps = session.get("timestamps")
+        while timestamps and now - timestamps[0] > self.window_seconds:
+            timestamps.popleft()
+        if len(timestamps) >= self.max_requests:
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {
+                    "code": -32001,
+                    "message": "Rate limit exceeded"
+                }
+            }
+        timestamps.append(now)
         
         try:
             # Convert dict to JSONRPCMessage
@@ -113,9 +131,11 @@ class MCPHTTPSSETransport:
             if response:
                 # Convert response back to dict
                 if hasattr(response, 'model_dump'):
-                    return response.model_dump()
+                    resp_dict = response.model_dump()
                 else:
-                    return response.__dict__
+                    resp_dict = response.__dict__
+                await session["message_queue"].put({"session_id": session_id, "response": resp_dict})
+                return resp_dict
                     
         except Exception as e:
             logger.error(f"Error handling message: {e}")
@@ -245,7 +265,9 @@ async def main():
         app=app,
         host="0.0.0.0",
         port=8001,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=30,
+        limit_concurrency=200
     )
     server = uvicorn.Server(config)
     await server.serve()

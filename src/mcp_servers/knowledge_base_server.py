@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import sys
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from mcp.server import Server
@@ -67,6 +69,12 @@ class KnowledgeBaseServer:
     
     def __init__(self):
         self.server = Server("knowledge-base-server")
+        self._cache_store: OrderedDict = OrderedDict()
+        self._cache_lock = asyncio.Lock()
+        self._inflight: Dict[str, asyncio.Task] = {}
+        self._cache_ttl_seconds = 300
+        self._max_cache_size = 1000
+        self._batch_semaphore = asyncio.Semaphore(8)
         self._setup_handlers()
     
     def _setup_handlers(self):
@@ -117,32 +125,31 @@ class KnowledgeBaseServer:
                 for db_id, retriever_info in retrievers.items():
                     safe_name = retriever_info["name"].replace(" ", "_").replace("-", "_")[:30]
                     tool_name = f"query_{safe_name}_{db_id}"
-                    
-                tools.append(Tool(
-                    name=tool_name,
-                    description=f"查询 {retriever_info['name']} 知识库（工具名已包含 db_id，无需传参）。{retriever_info.get('description', '')}",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query_text": {
-                                "type": "string",
-                                "description": "查询文本"
+                    tools.append(Tool(
+                        name=tool_name,
+                        description=f"查询 {retriever_info['name']} 知识库（工具名已包含 db_id，无需传参）。{retriever_info.get('description', '')}",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {
+                                "query_text": {
+                                    "type": "string",
+                                    "description": "查询文本"
+                                },
+                                "mode": {
+                                    "type": "string",
+                                    "description": "查询模式",
+                                    "enum": ["local", "global", "hybrid", "naive", "mix"]
+                                },
+                                "top_k": {
+                                    "type": "integer",
+                                    "description": "返回数量上限",
+                                    "minimum": 1,
+                                    "maximum": 100
+                                }
                             },
-                            "mode": {
-                                "type": "string",
-                                "description": "查询模式",
-                                "enum": ["local", "global", "hybrid", "naive", "mix"]
-                            },
-                            "top_k": {
-                                "type": "integer",
-                                "description": "返回数量上限",
-                                "minimum": 1,
-                                "maximum": 100
-                            }
-                        },
-                        "required": ["query_text"]
-                    }
-                ))
+                            "required": ["query_text"]
+                        }
+                    ))
                 
                 # Add database listing tool
                 tools.append(Tool(
@@ -211,20 +218,33 @@ class KnowledgeBaseServer:
                 )
     
     async def _query_knowledge_base(self, arguments: Dict[str, Any]) -> CallToolResult:
-        """Query a single knowledge base and return raw output without reranking"""
         try:
             query_text_input = arguments.get("query_text", "")
             db_id = arguments.get("db_id")
-            mode = arguments.get("mode", "mix")
-            top_k = arguments.get("top_k", 10)
+            meta_args = {k: v for k, v in arguments.items() if k not in {"query_text", "db_id"}}
 
             if isinstance(query_text_input, list):
-                if len(query_text_input) != 1:
+                texts: List[str] = [t for t in query_text_input if isinstance(t, str) and t.strip()]
+                if not texts:
                     return CallToolResult(
-                        content=[TextContent(type="text", text="错误：仅允许传入一个 query_text")],
+                        content=[TextContent(type="text", text="错误：缺少必填参数 query_text")],
                         isError=True
                     )
-                query_text_input = query_text_input[0]
+                results: List[Any] = []
+                async def _run_one(q: str) -> Any:
+                    return await self._cached_query_one(q.strip(), db_id, meta_args)
+                tasks = []
+                for q in texts:
+                    await self._batch_semaphore.acquire()
+                    tasks.append(asyncio.create_task(self._run_with_semaphore(_run_one, q)))
+                aggregated = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in aggregated:
+                    if isinstance(r, Exception):
+                        results.append({"error": str(r)})
+                    else:
+                        results.append(r)
+                text_out = json.dumps({"results": results}, ensure_ascii=False, indent=2)
+                return CallToolResult(content=[TextContent(type="text", text=text_out)])
 
             if not isinstance(query_text_input, str) or not query_text_input.strip():
                 return CallToolResult(
@@ -238,7 +258,7 @@ class KnowledgeBaseServer:
                     isError=True
                 )
 
-            raw_result = await knowledge_base.aquery(query_text_input, db_id=db_id, mode=mode, top_k=top_k)
+            raw_result = await self._cached_query_one(query_text_input.strip(), db_id, meta_args)
 
             if raw_result is None or raw_result == "":
                 return CallToolResult(
@@ -258,6 +278,55 @@ class KnowledgeBaseServer:
                 content=[TextContent(type="text", text=f"查询知识库出错: {str(e)}")],
                 isError=True
             )
+
+    async def _run_with_semaphore(self, func, q: str) -> Any:
+        try:
+            return await func(q)
+        finally:
+            self._batch_semaphore.release()
+
+    def _make_cache_key(self, query: str, db_id: str, meta: Dict[str, Any]) -> str:
+        qn = query.strip().lower()
+        mid = (db_id or "").strip()
+        clean_meta = {k: v for k, v in meta.items() if v is not None}
+        if "top_k" in clean_meta:
+            try:
+                clean_meta["top_k"] = max(1, min(int(clean_meta["top_k"]), 100))
+            except Exception:
+                clean_meta["top_k"] = 10
+        meta_str = json.dumps(clean_meta, sort_keys=True, ensure_ascii=False)
+        return f"{mid}|{meta_str}|{qn}"
+
+    async def _cached_query_one(self, query: str, db_id: str, meta: Dict[str, Any]) -> Any:
+        tk = max(1, min(int((meta or {}).get("top_k", 10)), 100))
+        meta_norm = dict(meta or {})
+        meta_norm["top_k"] = tk
+        key = self._make_cache_key(query, db_id, meta_norm)
+        now = time.monotonic()
+        async with self._cache_lock:
+            if key in self._cache_store:
+                expiry, value = self._cache_store[key]
+                if expiry > now:
+                    self._cache_store.move_to_end(key)
+                    return value
+                else:
+                    del self._cache_store[key]
+            existing = self._inflight.get(key)
+            if existing:
+                fut = existing
+            else:
+                fut = asyncio.create_task(knowledge_base.aquery(query, db_id=db_id, **meta_norm))
+                self._inflight[key] = fut
+        try:
+            result = await fut
+        finally:
+            async with self._cache_lock:
+                self._inflight.pop(key, None)
+        async with self._cache_lock:
+            self._cache_store[key] = (now + self._cache_ttl_seconds, result)
+            if len(self._cache_store) > self._max_cache_size:
+                self._cache_store.popitem(last=False)
+        return result
     
     def _process_query_result(self, result: Any, db_id: str, source_name: str) -> List[Dict[str, Any]]:
         """Process query result and add metadata with knowledge base type detection"""
