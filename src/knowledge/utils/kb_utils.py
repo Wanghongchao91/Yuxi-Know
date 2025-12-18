@@ -1,22 +1,24 @@
 import hashlib
 import os
 import time
+import traceback
 from pathlib import Path
 
 import aiofiles
 from langchain_text_splitters import MarkdownTextSplitter
 
 from src import config
+from src.config.static.models import EmbedModelInfo
 from src.utils import hashstr, logger
 from src.utils.datetime_utils import utc_isoformat
 
 
 def validate_file_path(file_path: str, db_id: str = None) -> str:
     """
-    验证文件路径安全性，防止路径遍历攻击
+    验证文件路径安全性，防止路径遍历攻击 - 支持本地文件和MinIO URL
 
     Args:
-        file_path: 要验证的文件路径
+        file_path: 要验证的文件路径或MinIO URL
         db_id: 数据库ID，用于获取知识库特定的上传目录
 
     Returns:
@@ -26,7 +28,12 @@ def validate_file_path(file_path: str, db_id: str = None) -> str:
         ValueError: 如果路径不安全
     """
     try:
-        # 规范化路径
+        # 检测是否是MinIO URL，如果是则直接返回（不进行路径遍历检查）
+        if is_minio_url(file_path):
+            logger.debug(f"MinIO URL detected, skipping path validation: {file_path}")
+            return file_path
+
+        # 规范化路径（仅对本地文件）
         normalized_path = os.path.abspath(os.path.realpath(file_path))
 
         # 获取允许的根目录
@@ -134,32 +141,72 @@ async def calculate_content_hash(data: bytes | bytearray | str | os.PathLike[str
 
 async def prepare_item_metadata(item: str, content_type: str, db_id: str, params: dict | None = None) -> dict:
     """
-    准备文件或URL的元数据
+    准备文件或URL的元数据 - 支持本地文件和MinIO文件
 
     Args:
-        item: 文件路径或URL
+        item: 文件路径或MinIO URL
         content_type: 内容类型 ("file" 或 "url")
         db_id: 数据库ID
         params: 处理参数，可选
     """
     if content_type == "file":
-        file_path = Path(item)
-        file_id = f"file_{hashstr(str(file_path) + str(time.time()), 6)}"
-        file_type = file_path.suffix.lower().replace(".", "")
-        filename = file_path.name
-        item_path = os.path.relpath(file_path, Path.cwd())
-        content_hash = None
-        try:
-            if file_path.exists():
-                content_hash = await calculate_content_hash(file_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Failed to calculate content hash for {file_path}: {exc}")
+        # 检测是否是MinIO URL还是本地文件路径
+        if is_minio_url(item):
+            # MinIO文件处理
+            logger.debug(f"Processing MinIO file: {item}")
+            # 从MinIO URL中提取文件名
+            if "?" in item:
+                # URL可能包含查询参数，去掉它们
+                item_clean = item.split("?")[0]
+            else:
+                item_clean = item
+
+            # 获取文件名（从路径的最后部分）
+            filename = item_clean.split("/")[-1]
+
+            # 如果文件名包含时间戳，提取原始文件名
+            import re
+
+            timestamp_pattern = r"^(.+)_(\d{13})(\.[^.]+)$"
+            match = re.match(timestamp_pattern, filename)
+            if match:
+                original_filename = match.group(1) + match.group(3)
+                # 存储原始文件名用于显示
+                filename_display = original_filename
+            else:
+                filename_display = filename
+
+            file_type = filename.split(".")[-1].lower() if "." in filename else ""
+            item_path = item  # 保持MinIO URL作为路径
+
+            # 从URL或params中获取content_hash（如果有的话）
+            content_hash = None
+            if params and "content_hash" in params:
+                content_hash = params["content_hash"]
+
+        else:
+            # 本地文件处理
+            file_path = Path(item)
+            file_type = file_path.suffix.lower().replace(".", "")
+            filename = file_path.name
+            filename_display = filename
+            item_path = os.path.relpath(file_path, Path.cwd())
+            content_hash = None
+            try:
+                if file_path.exists():
+                    content_hash = await calculate_content_hash(file_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Failed to calculate content hash for {file_path}: {exc}")
+
+        # 生成文件ID
+        file_id = f"file_{hashstr(str(item_path) + str(time.time()), 6)}"
+
     else:
         raise ValueError("URL 元数据生成已禁用")
 
     metadata = {
         "database_id": db_id,
-        "filename": filename,
+        "filename": filename_display,  # 使用显示用的文件名
         "path": item_path,
         "file_type": file_type,
         "status": "processing",
@@ -243,43 +290,94 @@ def get_embedding_config(embed_info: dict) -> dict:
     Returns:
         dict: 标准化的嵌入配置
     """
-    config_dict = {}
-
     try:
-        if embed_info:
-            # 优先检查是否有 model_id 字段
-            if "model_id" in embed_info:
-                from src.models.embed import select_embedding_model
+        # 使用最新配置
+        assert isinstance(embed_info, dict), f"embed_info must be a dict, got {type(embed_info)}"
+        assert "model_id" in embed_info, f"embed_info must contain 'model_id', got {embed_info}"
+        logger.warning(f"Using model_id: {embed_info['model_id']}")
+        config_dict = config.embed_model_names[embed_info["model_id"]].model_dump()
+        config_dict["api_key"] = os.getenv(config_dict["api_key"]) or config_dict["api_key"]
+        return config_dict
 
-                model = select_embedding_model(embed_info["model_id"])
-                config_dict["model"] = model.model
-                config_dict["api_key"] = model.api_key
-                config_dict["base_url"] = model.base_url
-                config_dict["dimension"] = getattr(model, "dimension", 1024)
-            elif hasattr(embed_info, "name"):
-                # EmbedModelInfo 对象
-                config_dict["model"] = embed_info.name
-                config_dict["api_key"] = os.getenv(embed_info.api_key) or embed_info.api_key
-                config_dict["base_url"] = embed_info.base_url
-                config_dict["dimension"] = embed_info.dimension
-            else:
-                # 字典形式（保持向后兼容）
-                config_dict["model"] = embed_info["name"]
-                config_dict["api_key"] = os.getenv(embed_info["api_key"]) or embed_info["api_key"]
-                config_dict["base_url"] = embed_info["base_url"]
-                config_dict["dimension"] = embed_info.get("dimension", 1024)
-        else:
-            from src.models import select_embedding_model
+    except AssertionError as e:
+        logger.error(f"AssertionError in get_embedding_config: {e}, embed_info={embed_info}")
 
-            default_model = select_embedding_model(config.embed_model)
-            config_dict["model"] = default_model.model
-            config_dict["api_key"] = default_model.api_key
-            config_dict["base_url"] = default_model.base_url
-            config_dict["dimension"] = getattr(default_model, "dimension", 1024)
+
+    # 兼容性检查：旧版配置字段
+    try:
+        # 1. 检查 embed_info 是否有效
+        if not embed_info or ("model" not in embed_info and "name" not in embed_info):
+            logger.error(f"Invalid embed_info: {embed_info}, using default embedding model config")
+            raise ValueError("Invalid embed_info: must be a non-empty dictionary")
+
+        # 2. 检查是否是 EmbedModelInfo 对象（在某些情况下可能直接传入对象）
+        if hasattr(embed_info, "name") and isinstance(embed_info, EmbedModelInfo):
+            logger.debug(f"Using EmbedModelInfo object: {embed_info.name}, {traceback.format_exc()}")
+            config_dict = embed_info.model_dump()
+            config_dict["api_key"] = os.getenv(config_dict["api_key"]) or config_dict["api_key"]
+            return config_dict
+
+        raise ValueError(f"Unsupported embed_info format: {embed_info}")
 
     except Exception as e:
-        logger.error(f"Error in get_embedding_config: {e}, {embed_info}")
-        raise ValueError(f"Error in get_embedding_config: {e}")
+        logger.error(f"Error in get_embedding_config: {e}, embed_info={embed_info}")
+        # 返回默认配置作为fallback
+        logger.warning("Falling back to default embedding model config")
+        try:
+            config_dict = config.embed_model_names[config.embed_model].model_dump()
+            config_dict["api_key"] = os.getenv(config_dict["api_key"]) or config_dict["api_key"]
+            return config_dict
+        except Exception as fallback_error:
+            logger.error(f"Failed to get default embedding config: {fallback_error}")
+            raise ValueError(f"Failed to get embedding config and fallback failed: {e}")
 
-    logger.debug(f"Embedding config: {config_dict}")
-    return config_dict
+
+def is_minio_url(file_path: str) -> bool:
+    """
+    检测是否是MinIO URL
+
+    Args:
+        file_path: 文件路径或URL
+
+    Returns:
+        bool: 是否是MinIO URL
+    """
+    return file_path.startswith(("http://", "https://", "s3://")) or "minio" in file_path.lower()
+
+
+def parse_minio_url(file_path: str) -> tuple[str, str]:
+    """
+    解析MinIO URL，提取bucket名称和对象名称
+
+    Args:
+        file_path: MinIO文件URL
+
+    Returns:
+        tuple[str, str]: (bucket_name, object_name)
+
+    Raises:
+        ValueError: 如果无法解析URL
+    """
+    try:
+        from urllib.parse import urlparse
+
+        # 解析URL
+        parsed_url = urlparse(file_path)
+
+        # 从URL路径中提取对象名称（去掉开头的斜杠）
+        object_name = parsed_url.path.lstrip("/")
+
+        # 分离bucket名称和对象名称
+        path_parts = object_name.split("/", 1)
+        if len(path_parts) > 1:
+            bucket_name = path_parts[0]
+            object_name = path_parts[1]
+        else:
+            raise ValueError(f"无法解析MinIO URL中的bucket名称: {file_path}")
+
+        logger.debug(f"Parsed MinIO URL: bucket_name={bucket_name}, object_name={object_name}")
+        return bucket_name, object_name
+
+    except Exception as e:
+        logger.error(f"Failed to parse MinIO URL {file_path}: {e}")
+        raise ValueError(f"无法解析MinIO URL: {file_path}")

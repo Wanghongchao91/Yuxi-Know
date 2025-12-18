@@ -1,14 +1,15 @@
 <template>
-  <div class="search-config-tab">
-    <div class="config-header">
-      <p class="config-title">检索配置</p>
-      <div class="config-actions">
-        <a-button size="small" @click="resetToDefaults">重置默认</a-button>
-        <a-button size="small" type="primary" @click="saveConfig">保存配置</a-button>
-      </div>
-    </div>
-
-    <div class="config-content">
+  <a-modal
+    :open="props.modelValue"
+    title="检索配置"
+    width="800px"
+    :confirm-loading="loading"
+    @ok="handleSave"
+    @cancel="handleCancel"
+    ok-text="保存"
+    cancel-text="取消"
+  >
+    <div class="search-config-modal">
       <div v-if="loading" class="config-loading">
         <a-spin size="large" />
         <p>加载配置参数中...</p>
@@ -46,11 +47,12 @@
                 </a-select>
                 <a-select
                   v-else-if="param.type === 'boolean'"
-                  v-model:value="meta[param.key]"
+                  :value="computedMeta[param.key]"
+                  @update:value="(value) => updateMeta(param.key, value)"
                   style="width: 100%;"
                 >
-                  <a-select-option :value="true">启用</a-select-option>
-                  <a-select-option :value="false">关闭</a-select-option>
+                  <a-select-option value="true">启用</a-select-option>
+                  <a-select-option value="false">关闭</a-select-option>
                 </a-select>
                 <a-input-number
                   v-else-if="param.type === 'number'"
@@ -65,21 +67,27 @@
         </a-form>
       </div>
     </div>
-  </div>
+  </a-modal>
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue';
+import { ref, reactive, computed, watch } from 'vue';
 import { useDatabaseStore } from '@/stores/database';
 import { message } from 'ant-design-vue';
 import { queryApi } from '@/apis/knowledge_api';
 
 const props = defineProps({
+  modelValue: {
+    type: Boolean,
+    default: false
+  },
   databaseId: {
     type: String,
-    required: true
+    default: ''
   }
 });
+
+const emit = defineEmits(['update:modelValue', 'save']);
 
 const store = useDatabaseStore();
 
@@ -89,11 +97,44 @@ const error = ref('');
 const queryParams = ref([]);
 const meta = reactive({});
 
+// 计算属性：处理布尔类型的双向绑定
+const computedMeta = computed(() => {
+  const result = {};
+  for (const key in meta) {
+    const param = queryParams.value.find(p => p.key === key);
+    if (param?.type === 'boolean') {
+      // 对于布尔类型，返回字符串给 select，但保持内部为布尔值
+      result[key] = meta[key].toString();
+    } else {
+      result[key] = meta[key];
+    }
+  }
+  return result;
+});
+
+// 处理值更新
+const updateMeta = (key, value) => {
+  const param = queryParams.value.find(p => p.key === key);
+  if (param?.type === 'boolean') {
+    // 将字符串转换回布尔值
+    meta[key] = value === 'true';
+  } else {
+    meta[key] = value;
+  }
+};
+
 // 加载查询参数
 const loadQueryParams = async () => {
   try {
     loading.value = true;
     error.value = '';
+
+    // 如果没有 databaseId，不执行请求
+    if (!props.databaseId) {
+      queryParams.value = [];
+      loading.value = false;
+      return;
+    }
 
     const response = await queryApi.getKnowledgeBaseQueryParams(props.databaseId);
     queryParams.value = response.params?.options || [];
@@ -104,7 +145,12 @@ const loadQueryParams = async () => {
     // 初始化 meta 对象
     queryParams.value.forEach(param => {
       if (param.default !== undefined) {
-        meta[param.key] = param.default;
+        // 对于布尔类型，确保使用布尔值而不是字符串
+        if (param.type === 'boolean') {
+          meta[param.key] = Boolean(param.default);
+        } else {
+          meta[param.key] = param.default;
+        }
       }
     });
 
@@ -124,10 +170,23 @@ const loadQueryParams = async () => {
 
 // 加载保存的配置
 const loadSavedConfig = () => {
+  if (!props.databaseId) return;
+
   const saved = localStorage.getItem(`search-config-${props.databaseId}`);
   if (saved) {
     try {
       const savedConfig = JSON.parse(saved);
+
+      // 处理布尔类型转换
+      queryParams.value.forEach(param => {
+        if (param.type === 'boolean' && savedConfig[param.key] !== undefined) {
+          // 将字符串值转换为布尔值
+          if (typeof savedConfig[param.key] === 'string') {
+            savedConfig[param.key] = savedConfig[param.key] === 'true';
+          }
+        }
+      });
+
       Object.assign(meta, savedConfig);
     } catch (e) {
       console.warn('Failed to parse saved config:', e);
@@ -150,56 +209,53 @@ const resetToDefaults = () => {
 };
 
 // 保存配置
-const saveConfig = () => {
+const handleSave = async () => {
+  // 如果没有 databaseId，不执行保存
+  if (!props.databaseId) {
+    message.error('无法保存配置：缺少知识库ID');
+    return;
+  }
+
   // 确保 include_distances 始终为 true
   meta['include_distances'] = true;
 
-  localStorage.setItem(`search-config-${props.databaseId}`, JSON.stringify(meta));
+  // 先保存到知识库元数据
+  try {
+    const response = await queryApi.updateKnowledgeBaseQueryParams(props.databaseId, meta);
+    if (response.message === 'success') {
+      // 服务器保存成功后，再保存到 localStorage（兼容性）
+      localStorage.setItem(`search-config-${props.databaseId}`, JSON.stringify(meta));
+      message.success('配置已保存');
 
-  // 更新 store 中的配置
-  Object.assign(store.meta, meta);
+      // 更新 store 中的配置
+      Object.assign(store.meta, meta);
 
-  message.success('配置已保存');
+      // 触发保存事件
+      emit('save', { ...meta });
+      emit('update:modelValue', false);
+    } else {
+      throw new Error(response.message || '保存失败');
+    }
+  } catch (error) {
+    console.error('保存配置到知识库失败:', error);
+    message.error('保存配置失败：' + error.message);
+  }
 };
 
-// 组件挂载时加载数据
-onMounted(() => {
-  loadQueryParams();
+// 处理取消
+const handleCancel = () => {
+  emit('update:modelValue', false);
+};
+
+// 监听弹窗显示状态，显示时加载数据
+watch(() => props.modelValue, (newVal) => {
+  if (newVal && props.databaseId) {
+    loadQueryParams();
+  }
 });
 </script>
 
 <style lang="less" scoped>
-.search-config-tab {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  background: var(--gray-0);
-}
-
-.config-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 16px;
-  // border-bottom: 1px solid var(--gray-200);
-  flex-shrink: 0;
-
-  .config-title {
-    margin: 0;
-    color: var(--gray-800);
-  }
-
-  .config-actions {
-    display: flex;
-    gap: 8px;
-  }
-}
-
-.config-content {
-  flex: 1;
-  padding: 16px;
-  overflow-y: auto;
-}
 
 .config-loading,
 .config-error {
@@ -207,7 +263,7 @@ onMounted(() => {
   flex-direction: column;
   justify-content: center;
   align-items: center;
-  height: 100%;
+  height: 300px;
   color: var(--gray-500);
 
   p {
@@ -217,9 +273,8 @@ onMounted(() => {
 }
 
 .config-forms {
-  max-width: 800px;
+  max-width: 100%;
 }
-
 
 // 表单样式优化
 :deep(.ant-form-item) {

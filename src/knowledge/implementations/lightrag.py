@@ -295,13 +295,39 @@ class LightRagKB(KnowledgeBase):
     def _get_embedding_func(self, embed_info: dict):
         """获取 embedding 函数"""
         config_dict = get_embedding_config(embed_info)
+        logger.debug(f"Embedding config dict: {config_dict}")
 
+        if config_dict.get("model_id") and config_dict["model_id"].startswith("ollama"):
+            from lightrag.llm.ollama import ollama_embed
+
+            from src.utils import get_docker_safe_url
+
+            host = get_docker_safe_url(config_dict["base_url"].replace("/api/embed", ""))
+            logger.debug(f"Ollama host: {host}")
+            return EmbeddingFunc(
+                embedding_dim=config_dict["dimension"],
+                max_token_size=8192,
+                func=lambda texts: ollama_embed(
+                    texts=texts,
+                    embed_model=config_dict["name"],
+                    api_key=config_dict["api_key"],
+                    host=host,
+                ),
+            )
+
+        # 尝试获取模型名称，支持多种键名以保持兼容性
+        if "name" in config_dict and config_dict["name"]:
+            model_name = config_dict["name"]
+        elif "model" in config_dict and config_dict["model"]:
+            model_name = config_dict["model"]
+        else:
+            raise ValueError(f"Neither 'name' nor 'model' found in config_dict or both are empty: {config_dict}")
         return EmbeddingFunc(
             embedding_dim=config_dict["dimension"],
-            max_token_size=4096,
+            max_token_size=8192,
             func=lambda texts: openai_embed(
                 texts=texts,
-                model=config_dict["model"],
+                model=model_name,
                 api_key=config_dict["api_key"],
                 base_url=config_dict["base_url"].replace("/embeddings", ""),
             ),
@@ -460,12 +486,37 @@ class LightRagKB(KnowledgeBase):
             raise ValueError(f"Database {db_id} not found")
 
         try:
+            # QueryParam 支持的参数列表
+            valid_params = {
+                "mode",
+                "only_need_context",
+                "only_need_prompt",
+                "response_type",
+                "stream",
+                "top_k",
+                "chunk_top_k",
+                "max_entity_tokens",
+                "max_relation_tokens",
+                "max_total_tokens",
+                "hl_keywords",
+                "ll_keywords",
+                "conversation_history",
+                "history_turns",
+                "model_func",
+                "user_prompt",
+                "enable_rerank",
+                "include_references",
+            }
+
+            # 过滤 kwargs，只保留 QueryParam 支持的参数
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+
             # 设置查询参数
             params_dict = {
                 "mode": "mix",
                 "only_need_context": True,
                 "top_k": 10,
-            } | kwargs
+            } | filtered_kwargs
             param = QueryParam(**params_dict)
 
             # 执行查询

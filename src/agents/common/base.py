@@ -74,7 +74,7 @@ class BaseAgent:
 
         # 从 input_context 中提取 attachments（如果有）
         attachments = (input_context or {}).get("attachments", [])
-        input_config = {"configurable": input_context, "recursion_limit": 100}
+        input_config = {"configurable": input_context, "recursion_limit": 300}
 
         async for msg, metadata in graph.astream(
             {"messages": messages, "attachments": attachments},
@@ -156,7 +156,11 @@ class BaseAgent:
 
     async def get_async_conn(self) -> aiosqlite.Connection:
         """获取异步数据库连接"""
-        return await aiosqlite.connect(os.path.join(self.workdir, "aio_history.db"))
+        conn = await aiosqlite.connect(os.path.join(self.workdir, "aio_history.db"))
+        # Patch: langgraph's AsyncSqliteSaver expects is_alive() method which aiosqlite may not have
+        if not hasattr(conn, "is_alive"):
+            conn.is_alive = lambda: True
+        return conn
 
     async def get_aio_memory(self) -> AsyncSqliteSaver:
         """获取异步存储实例"""

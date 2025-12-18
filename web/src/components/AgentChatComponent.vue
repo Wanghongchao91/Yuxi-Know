@@ -64,8 +64,8 @@
               :class="{ 'has-content': hasAgentStateContent }"
               :title="hasAgentStateContent ? '查看工作状态' : '暂无工作状态'"
             >
-              <Layers class="nav-btn-icon" size="18"/>
-              <span v-if="hasAgentStateContent" class="text">状态({{ totalAgentStateItems }})</span>
+              <FolderDotIcon class="nav-btn-icon" size="18"/>
+              <span v-if="hasAgentStateContent" class="text">状态</span>
             </div>
           </AgentPopover>
           <!-- <div class="nav-btn" @click="shareChat" v-if="currentChatId && currentAgent">
@@ -243,7 +243,7 @@ import AgentMessageComponent from '@/components/AgentMessageComponent.vue'
 import ImagePreviewComponent from '@/components/ImagePreviewComponent.vue'
 import ChatSidebarComponent from '@/components/ChatSidebarComponent.vue'
 import RefsComponent from '@/components/RefsComponent.vue'
-import { PanelLeftOpen, MessageCirclePlus, LoaderCircle, Layers, ChevronDown } from 'lucide-vue-next';
+import { PanelLeftOpen, MessageCirclePlus, LoaderCircle, FolderDotIcon, ChevronDown } from 'lucide-vue-next';
 import { handleChatError, handleValidationError } from '@/utils/errorHandler';
 import { ScrollController } from '@/utils/scrollController';
 import { AgentValidator } from '@/utils/agentValidator';
@@ -338,7 +338,7 @@ const currentAgentName = computed(() => {
     const agent = agents.value.find(a => a.id === agentId);
     return agent ? agent.name : '智能体';
   }
-  return '智能体';
+  return '智能体加载中……';
 });
 
 const currentAgent = computed(() => {
@@ -395,14 +395,6 @@ const hasAgentStateContent = computed(() => {
   const todoCount = Array.isArray(s.todos) ? s.todos.length : 0;
   const fileCount = countFiles(s.files);
   return todoCount > 0 || fileCount > 0;
-});
-
-const totalAgentStateItems = computed(() => {
-  const s = currentAgentState.value;
-  if (!s) return 0;
-  const todoCount = Array.isArray(s.todos) ? s.todos.length : 0;
-  const fileCount = countFiles(s.files);
-  return todoCount + fileCount;
 });
 
 const currentThreadMessages = computed(() => threadMessages.value[currentChatId.value] || []);
@@ -565,8 +557,8 @@ const resetOnGoingConv = (threadId = null, preserveMessages = false) => {
         if (preserveMessages) {
           setTimeout(() => {
             if (threadState.onGoingConv) {
-        threadState.onGoingConv = createOnGoingConvState();
-      }
+              threadState.onGoingConv = createOnGoingConvState();
+            }
           }, 100);
         } else {
           threadState.onGoingConv = createOnGoingConvState();
@@ -614,7 +606,7 @@ const _processStreamChunk = (chunk, threadId) => {
       }
 
       // Reload messages to show any partial content saved by the backend
-      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId });
+      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 500 });
       resetOnGoingConv(threadId);
       return true;
     case 'human_approval_required':
@@ -643,7 +635,7 @@ const _processStreamChunk = (chunk, threadId) => {
         }
       }
       // 异步加载历史记录，保持当前消息显示直到历史记录加载完成
-      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId })
+      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 500 })
         .finally(() => {
           // 历史记录加载完成后，安全地清空当前进行中的对话
           resetOnGoingConv(threadId, true);
@@ -658,7 +650,7 @@ const _processStreamChunk = (chunk, threadId) => {
       if (chunkMessage) {
         message.info(chunkMessage);
       }
-      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId })
+      fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 1000 })
         .finally(() => {
         resetOnGoingConv(threadId, true);
       });
@@ -1116,7 +1108,7 @@ const handleSendOrStop = async () => {
 
     // 中断后刷新消息历史，确保显示最新的状态
     try {
-      await fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 100 });
+      await fetchThreadMessages({ agentId: currentAgentId.value, threadId: threadId, delay: 500 });
       message.info('已中断对话生成');
     } catch (error) {
       console.error('刷新消息历史失败:', error);
@@ -1841,13 +1833,9 @@ watch(conversations, () => {
 }
 
 /* AgentState 按钮有内容时的样式 */
-.agent-nav-btn.agent-state-btn.has-content {
-  color: var(--main-600);
-
-  &:hover:not(.is-disabled) {
-    color: var(--main-700);
-    background-color: var(--main-40);
-  }
+.agent-nav-btn.agent-state-btn.has-content:hover:not(.is-disabled) {
+  color: var(--main-700);
+  background-color: var(--main-20);
 }
 
 @keyframes spin {

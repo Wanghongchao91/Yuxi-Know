@@ -24,11 +24,13 @@ logs
 *.log.*
 *.db
 *.lock
+!uv.lock
 tmp
 cache
 .cache
 .backup
 *.bak
+*._*
 
 
 ### IDE

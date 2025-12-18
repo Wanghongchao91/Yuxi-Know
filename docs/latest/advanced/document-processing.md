@@ -27,6 +27,10 @@
   - 优先处理名为 `full.md` 的文件，否则使用第一个 `.md` 文件
   - 支持图片目录的智能识别（`images/`、`../images/` 等）
 
+::: tip 图片显示
+文档中的图片会自动上传到对象存储并替换为可访问的 URL。但是如果想要在外部正常显示图片，需要配置 `HOST_IP` 环境变量，将其设置为您的服务器 IP 地址。
+:::
+
 ## 快速配置
 
 ### 1. 基础 OCR (RapidOCR)
@@ -44,18 +48,18 @@ docker compose up -d api
 需要在 `.env` 文件中配置：
 
 ```bash
-MINERU_VL_SERVER=http://localhost:30000
-MINERU_API_URI=http://localhost:30001
+MINERU_VL_SERVER=http://localhost:30000  # 对应 docker compose 中的 mineru-vllm-server 服务
+MINERU_API_URI=http://localhost:30001  # 对应 docker compose 中的 mineru-api 服务
 ```
 
 然后启动相关服务
 
 ```bash
 # 需要 GPU，启动 MinerU 服务
-docker compose up -d mineru-vllm-server mineru-api
+docker compose up mineru-vllm-server mineru-api -d
 
 # 启动主服务
-docker compose up -d api
+docker compose up api -d
 ```
 
 ### 3. 官方云服务 (MinerU Official)
@@ -69,7 +73,7 @@ API 密钥可以从 [MinerU 官网](https://mineru.net) 申请。
 MINERU_API_KEY="your-api-key-here"
 ```
 
-然后使用 `docker compose up -d api` 重启后端服务。
+然后使用 `docker compose up api -d` 重启后端服务。
 
 ### 4. 结构化解析 (PaddleX)
 

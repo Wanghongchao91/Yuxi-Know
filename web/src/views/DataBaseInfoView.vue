@@ -4,6 +4,7 @@
 
   <FileUploadModal
     v-model:visible="addFilesModalVisible"
+    @success="onFileUploadSuccess"
   />
 
   <div class="unified-layout">
@@ -41,8 +42,45 @@
             ref="mindmapSectionRef"
           />
         </a-tab-pane>
-        <a-tab-pane key="config" tab="检索配置">
-          <SearchConfigTab :database-id="databaseId" />
+        <a-tab-pane key="evaluation" tab="RAG评估" :disabled="!isEvaluationSupported">
+          <template #tab>
+            <span :style="{ color: !isEvaluationSupported ? 'var(--gray-400)' : '' }">
+              RAG评估
+              <a-tooltip v-if="!isEvaluationSupported" title="仅支持 Milvus 类型的知识库">
+                <InfoCircleOutlined style="margin-left: 4px;" />
+              </a-tooltip>
+            </span>
+          </template>
+          <RAGEvaluationTab
+            v-if="databaseId && isEvaluationSupported"
+            :database-id="databaseId"
+            @switch-to-benchmarks="activeTab = 'benchmarks'"
+          />
+        </a-tab-pane>
+        <a-tab-pane key="benchmarks" tab="评估基准" :disabled="!isEvaluationSupported">
+          <template #tab>
+            <span :style="{ color: !isEvaluationSupported ? 'var(--gray-400)' : '' }">
+              评估基准
+              <a-tooltip v-if="!isEvaluationSupported" title="仅支持 Milvus 类型的知识库">
+                <InfoCircleOutlined style="margin-left: 4px;" />
+              </a-tooltip>
+            </span>
+          </template>
+          <div class="benchmark-management-container">
+            <div class="benchmark-content">
+              <EvaluationBenchmarks
+                v-if="databaseId && isEvaluationSupported"
+                :database-id="databaseId"
+                @benchmark-selected="(benchmark) => {
+                  // 处理基准选择逻辑
+                  activeTab = 'evaluation';
+                }"
+                @refresh="() => {
+                  // 刷新逻辑
+                }"
+              />
+            </div>
+          </div>
         </a-tab-pane>
       </a-tabs>
     </div>
@@ -54,17 +92,21 @@
 import { onMounted, reactive, ref, watch, onUnmounted, computed } from 'vue';
 import { useRoute } from 'vue-router';
 import { useDatabaseStore } from '@/stores/database';
+import { useTaskerStore } from '@/stores/tasker';
+import { InfoCircleOutlined } from '@ant-design/icons-vue';
 import KnowledgeBaseCard from '@/components/KnowledgeBaseCard.vue';
 import FileTable from '@/components/FileTable.vue';
 import FileDetailModal from '@/components/FileDetailModal.vue';
 import FileUploadModal from '@/components/FileUploadModal.vue';
 import KnowledgeGraphSection from '@/components/KnowledgeGraphSection.vue';
 import QuerySection from '@/components/QuerySection.vue';
-import SearchConfigTab from '@/components/SearchConfigTab.vue';
 import MindMapSection from '@/components/MindMapSection.vue';
+import RAGEvaluationTab from '@/components/RAGEvaluationTab.vue';
+import EvaluationBenchmarks from '@/components/EvaluationBenchmarks.vue';
 
 const route = useRoute();
 const store = useDatabaseStore();
+const taskerStore = useTaskerStore();
 
 const databaseId = computed(() => store.databaseId);
 const database = computed(() => store.database);
@@ -73,6 +115,12 @@ const state = computed(() => store.state);
 const isGraphSupported = computed(() => {
   const kbType = database.value.kb_type?.toLowerCase();
   return kbType === 'lightrag';
+});
+
+// 计算属性：是否支持评估功能
+const isEvaluationSupported = computed(() => {
+  const kbType = database.value.kb_type?.toLowerCase();
+  return kbType === 'milvus';
 });
 
 // Tab 切换逻辑 - 智能默认
@@ -98,9 +146,9 @@ const resetGraphStats = () => {
 
 // LightRAG 默认展示知识图谱
 watch(
-  () => [databaseId.value, isGraphSupported.value],
-  ([newDbId, supported], oldValue = []) => {
-    const [oldDbId, previouslySupported] = oldValue;
+  () => [databaseId.value, isGraphSupported.value, isEvaluationSupported.value],
+  ([newDbId, supported, evaluationSupported], oldValue = []) => {
+    const [oldDbId, previouslySupported, previouslyEvaluationSupported] = oldValue;
 
     if (!newDbId) {
       return;
@@ -118,6 +166,11 @@ watch(
     }
 
     if (!supported && activeTab.value === 'graph') {
+      activeTab.value = 'query';
+    }
+
+    // 如果知识库类型不支持评估功能且当前在评估相关 tab，切换到查询 tab
+    if (!isEvaluationSupported.value && (activeTab.value === 'evaluation' || activeTab.value === 'benchmarks')) {
       activeTab.value = 'query';
     }
   },
@@ -143,6 +196,11 @@ const isInitialLoad = ref(true);
 // 显示添加文件弹窗
 const showAddFilesModal = () => {
   addFilesModalVisible.value = true;
+};
+
+// 文件上传成功回调
+const onFileUploadSuccess = () => {
+  taskerStore.loadTasks();
 };
 
 // 重置文件选中状态
@@ -184,30 +242,10 @@ watch(
       return;
     }
 
-    // 如果文件数量发生变化（增加或减少），都重新生成问题和思维导图
+    // 如果文件数量发生变化（增加或减少），只重新生成问题，不自动生成思维导图
     if (newFileCount !== oldFileCount) {
       const changeType = newFileCount > oldFileCount ? '增加' : '减少';
-      console.log(`文件数量从 ${oldFileCount} ${changeType}到 ${newFileCount}，准备重新生成问题和思维导图`);
-
-      // 只要有文件，就重新生成思维导图（无论增加还是减少）
-      if (newFileCount > 0) {
-        setTimeout(() => {
-          if (mindmapSectionRef.value) {
-            if (oldFileCount === 0) {
-              // 首次添加文件，生成思维导图
-              console.log('首次添加文件，生成思维导图');
-              mindmapSectionRef.value.generateMindmap();
-            } else {
-              // 文件数量变化（增加或减少），重新生成思维导图
-              console.log(`文件数量变化，重新生成思维导图`);
-              mindmapSectionRef.value.refreshMindmap();
-            }
-          }
-        }, 2000); // 等待2秒让后端处理完成
-      } else {
-        // 如果文件数量变为0，清空思维导图（如果需要的话）
-        console.log('文件数量为0，思维导图将自动清空');
-      }
+      console.log(`文件数量从 ${oldFileCount} ${changeType}到 ${newFileCount}，准备重新生成问题`);
 
       // 只要有文件，就重新生成问题（无论之前是否有问题）
       if (newFileCount > 0) {
@@ -528,5 +566,20 @@ const handleMouseUp = () => {
     flex: 1;
     overflow: hidden;
   }
+}
+
+// 基准管理样式
+.benchmark-management-container {
+  height: 100%;
+  background: var(--gray-0);
+  display: flex;
+  flex-direction: column;
+}
+
+.benchmark-content {
+  flex: 1;
+  overflow: hidden;
+  min-height: 0;
+  padding: 12px 16px;
 }
 </style>
